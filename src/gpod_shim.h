@@ -41,12 +41,21 @@ CpTrack *cp_track_node_track(const CpTrackNode *node);
 
 char *cp_track_path(const CpTrack *track);
 char *cp_track_title(const CpTrack *track);
+char *cp_track_album(const CpTrack *track);
 char *cp_track_artist(const CpTrack *track);
+char *cp_track_album_artist(const CpTrack *track);
+uint64_t cp_track_size(const CpTrack *track);
+uint32_t cp_track_duration_ms(const CpTrack *track);
+uint32_t cp_track_number(const CpTrack *track);
+uint32_t cp_track_disc_number(const CpTrack *track);
+int cp_track_has_artwork(const CpTrack *track);
+int cp_track_set_artwork(CpTrack *track, const unsigned char *data,
+                         size_t data_len, char **error);
 
 int cp_db_remove_track(CpDb *db, CpTrack *track, char **error);
 int cp_db_add_track(CpDb *db, const char *source_path,
-                    const CpMetadata *metadata, char **copied_path,
-                    char **error);
+                    const CpMetadata *metadata, const unsigned char *artwork_data,
+                    size_t artwork_len, char **copied_path, char **error);
 int cp_db_write(CpDb *db, char **error);
 
 void cp_string_free(char *value);

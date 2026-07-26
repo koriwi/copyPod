@@ -142,22 +142,20 @@ static char *cp_track_filesystem_path(Itdb_Track *track) {
     if (track == NULL) {
         return NULL;
     }
-
-    char *resolved = itdb_filename_on_ipod(track);
-    if (resolved != NULL || track->itdb == NULL || track->ipod_path == NULL) {
-        return resolved;
+    if (track->itdb == NULL || track->ipod_path == NULL) {
+        return itdb_filename_on_ipod(track);
     }
 
-    /* itdb_filename_on_ipod() returns NULL for a stale DB entry. Construct a
-       diagnostic path anyway so copyPod can classify and remove that entry. */
+    /* Build the path directly instead of asking libgpod to resolve every path
+       against the slow iPod filesystem. FAT paths are case-insensitive. */
     char *relative = g_strdup(track->ipod_path);
     itdb_filename_ipod2fs(relative);
     const char *mountpoint = itdb_get_mountpoint(track->itdb);
-    char *fallback = relative[0] == '/'
-                         ? g_strdup_printf("%s%s", mountpoint, relative)
-                         : g_build_filename(mountpoint, relative, NULL);
+    char *path = relative[0] == '/'
+                     ? g_strdup_printf("%s%s", mountpoint, relative)
+                     : g_build_filename(mountpoint, relative, NULL);
     g_free(relative);
-    return fallback;
+    return path;
 }
 
 char *cp_track_path(const CpTrack *opaque_track) {
@@ -169,9 +167,58 @@ char *cp_track_title(const CpTrack *opaque_track) {
     return g_strdup(track != NULL && track->title != NULL ? track->title : "");
 }
 
+char *cp_track_album(const CpTrack *opaque_track) {
+    const Itdb_Track *track = (const Itdb_Track *)opaque_track;
+    return g_strdup(track != NULL && track->album != NULL ? track->album : "");
+}
+
 char *cp_track_artist(const CpTrack *opaque_track) {
     const Itdb_Track *track = (const Itdb_Track *)opaque_track;
     return g_strdup(track != NULL && track->artist != NULL ? track->artist : "");
+}
+
+char *cp_track_album_artist(const CpTrack *opaque_track) {
+    const Itdb_Track *track = (const Itdb_Track *)opaque_track;
+    return g_strdup(track != NULL && track->albumartist != NULL ? track->albumartist : "");
+}
+
+uint64_t cp_track_size(const CpTrack *opaque_track) {
+    const Itdb_Track *track = (const Itdb_Track *)opaque_track;
+    return track != NULL ? track->size : 0;
+}
+
+uint32_t cp_track_duration_ms(const CpTrack *opaque_track) {
+    const Itdb_Track *track = (const Itdb_Track *)opaque_track;
+    return track != NULL && track->tracklen > 0 ? (uint32_t)track->tracklen : 0;
+}
+
+uint32_t cp_track_number(const CpTrack *opaque_track) {
+    const Itdb_Track *track = (const Itdb_Track *)opaque_track;
+    return track != NULL && track->track_nr > 0 ? (uint32_t)track->track_nr : 0;
+}
+
+uint32_t cp_track_disc_number(const CpTrack *opaque_track) {
+    const Itdb_Track *track = (const Itdb_Track *)opaque_track;
+    return track != NULL && track->cd_nr > 0 ? (uint32_t)track->cd_nr : 0;
+}
+
+int cp_track_has_artwork(const CpTrack *opaque_track) {
+    return opaque_track != NULL &&
+           itdb_track_has_thumbnails((Itdb_Track *)opaque_track);
+}
+
+int cp_track_set_artwork(CpTrack *opaque_track, const unsigned char *data,
+                         size_t data_len, char **error) {
+    if (opaque_track == NULL || data == NULL || data_len == 0) {
+        cp_set_error(error, "invalid track artwork request");
+        return 0;
+    }
+    if (!itdb_track_set_thumbnails_from_data((Itdb_Track *)opaque_track,
+                                              data, (gsize)data_len)) {
+        cp_set_error(error, "libgpod could not decode the cover image");
+        return 0;
+    }
+    return 1;
 }
 
 int cp_db_remove_track(CpDb *db, CpTrack *opaque_track, char **error) {
@@ -204,8 +251,8 @@ static char *cp_dup(const char *value) {
 }
 
 int cp_db_add_track(CpDb *db, const char *source_path,
-                    const CpMetadata *metadata, char **copied_path,
-                    char **error) {
+                    const CpMetadata *metadata, const unsigned char *artwork_data,
+                    size_t artwork_len, char **copied_path, char **error) {
     if (db == NULL || db->itdb == NULL || source_path == NULL || metadata == NULL) {
         cp_set_error(error, "invalid track copy request");
         return 0;
@@ -240,6 +287,14 @@ int cp_db_add_track(CpDb *db, const char *source_path,
                                : track->time_added;
     track->mediatype = ITDB_MEDIATYPE_AUDIO;
     track->type2 = 0x01; /* MP3 */
+
+    if (artwork_data != NULL && artwork_len > 0 &&
+        !itdb_track_set_thumbnails_from_data(track, artwork_data,
+                                              (gsize)artwork_len)) {
+        cp_set_error(error, "libgpod could not decode the cover image");
+        itdb_track_free(track);
+        return 0;
+    }
 
     Itdb_Playlist *master = itdb_playlist_mpl(db->itdb);
     itdb_track_add(db->itdb, track, -1);

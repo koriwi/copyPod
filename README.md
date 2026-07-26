@@ -1,8 +1,13 @@
 # copyPod
 
 copyPod mirrors one or more folders of MP3s to a mounted, non-Rockbox iPod.
-It skips identical files and deletes every iPod track that is not in the given
-folders, including tracks added by other programs.
+It matches existing songs by tags, file size and duration, then deletes every
+iPod track that is not in the given folders, including tracks added by other
+programs.
+
+Cover art comes from the MP3's embedded front cover, or from a JPEG/PNG named
+`cover`, `folder` or `front` beside the file. Missing artwork is added to
+matching songs without copying the audio again.
 
 It is Linux-only and uses `libgpod`.
 

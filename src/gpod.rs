@@ -45,12 +45,27 @@ extern "C" {
     fn cp_track_node_track(node: *const CpTrackNode) -> *mut CpTrack;
     fn cp_track_path(track: *const CpTrack) -> *mut c_char;
     fn cp_track_title(track: *const CpTrack) -> *mut c_char;
+    fn cp_track_album(track: *const CpTrack) -> *mut c_char;
     fn cp_track_artist(track: *const CpTrack) -> *mut c_char;
+    fn cp_track_album_artist(track: *const CpTrack) -> *mut c_char;
+    fn cp_track_size(track: *const CpTrack) -> u64;
+    fn cp_track_duration_ms(track: *const CpTrack) -> u32;
+    fn cp_track_number(track: *const CpTrack) -> u32;
+    fn cp_track_disc_number(track: *const CpTrack) -> u32;
+    fn cp_track_has_artwork(track: *const CpTrack) -> c_int;
+    fn cp_track_set_artwork(
+        track: *mut CpTrack,
+        data: *const u8,
+        data_len: usize,
+        error: *mut *mut c_char,
+    ) -> c_int;
     fn cp_db_remove_track(db: *mut CpDb, track: *mut CpTrack, error: *mut *mut c_char) -> c_int;
     fn cp_db_add_track(
         db: *mut CpDb,
         source_path: *const c_char,
         metadata: *const CpMetadata,
+        artwork_data: *const u8,
+        artwork_len: usize,
         copied_path: *mut *mut c_char,
         error: *mut *mut c_char,
     ) -> c_int;
@@ -86,7 +101,14 @@ pub struct Track {
     pub handle: TrackHandle,
     pub path: PathBuf,
     pub title: String,
+    pub album: String,
     pub artist: String,
+    pub album_artist: String,
+    pub size: u64,
+    pub duration_ms: u32,
+    pub track_number: u32,
+    pub disc_number: u32,
+    pub has_artwork: bool,
 }
 
 pub struct Database {
@@ -152,13 +174,34 @@ impl Database {
                 .ok_or_else(|| anyhow!("track has no file path"))?;
             let title =
                 take_string(unsafe { cp_track_title(handle.0.as_ptr()) }).unwrap_or_default();
+            let album =
+                take_string(unsafe { cp_track_album(handle.0.as_ptr()) }).unwrap_or_default();
             let artist =
                 take_string(unsafe { cp_track_artist(handle.0.as_ptr()) }).unwrap_or_default();
+            let album_artist = take_string(unsafe { cp_track_album_artist(handle.0.as_ptr()) })
+                .unwrap_or_default();
+            // SAFETY: handle refers to a live track owned by this database.
+            let (size, duration_ms, track_number, disc_number, has_artwork) = unsafe {
+                (
+                    cp_track_size(handle.0.as_ptr()),
+                    cp_track_duration_ms(handle.0.as_ptr()),
+                    cp_track_number(handle.0.as_ptr()),
+                    cp_track_disc_number(handle.0.as_ptr()),
+                    cp_track_has_artwork(handle.0.as_ptr()) != 0,
+                )
+            };
             tracks.push(Track {
                 handle,
                 path,
                 title,
+                album,
                 artist,
+                album_artist,
+                size,
+                duration_ms,
+                track_number,
+                disc_number,
+                has_artwork,
             });
             // SAFETY: node remains valid because the database has not been mutated.
             node = unsafe { cp_track_node_next(node) };
@@ -174,7 +217,26 @@ impl Database {
         call_result(ok, error)
     }
 
-    pub fn add_track(&mut self, source: &Path, metadata: &Metadata) -> Result<PathBuf> {
+    pub fn set_artwork(&mut self, track: TrackHandle, artwork: &[u8]) -> Result<()> {
+        let mut error = ptr::null_mut();
+        // SAFETY: the track belongs to this database and artwork is valid for the call.
+        let ok = unsafe {
+            cp_track_set_artwork(
+                track.0.as_ptr(),
+                artwork.as_ptr(),
+                artwork.len(),
+                &mut error,
+            )
+        };
+        call_result(ok, error)
+    }
+
+    pub fn add_track(
+        &mut self,
+        source: &Path,
+        metadata: &Metadata,
+        artwork: Option<&[u8]>,
+    ) -> Result<PathBuf> {
         let source_c = path_to_cstring(source)?;
         let title = to_cstring(&metadata.title, "title")?;
         let album = to_cstring(&metadata.album, "album")?;
@@ -200,14 +262,19 @@ impl Database {
             disc_number: metadata.disc_number,
             disc_total: metadata.disc_total,
         };
+        let (artwork_data, artwork_len) = artwork
+            .map(|data| (data.as_ptr(), data.len()))
+            .unwrap_or((ptr::null(), 0));
         let mut copied_path = ptr::null_mut();
         let mut error = ptr::null_mut();
-        // SAFETY: all strings and metadata remain alive for the duration of the call.
+        // SAFETY: all strings, metadata and artwork remain alive for the call.
         let ok = unsafe {
             cp_db_add_track(
                 self.raw.as_ptr(),
                 source_c.as_ptr(),
                 &raw_metadata,
+                artwork_data,
+                artwork_len,
                 &mut copied_path,
                 &mut error,
             )

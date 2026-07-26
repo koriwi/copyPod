@@ -1,15 +1,14 @@
 mod gpod;
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::{BufReader, Read, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{anyhow, bail, Context, Result};
-use blake3::Hash;
 use clap::Parser;
 use lofty::file::{AudioFile, TaggedFileExt};
+use lofty::picture::PictureType;
 use lofty::prelude::Accessor;
 use lofty::probe::Probe;
 use walkdir::WalkDir;
@@ -38,16 +37,38 @@ struct Cli {
 }
 
 #[derive(Debug)]
+struct Artwork {
+    data: Vec<u8>,
+    source: String,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct TrackKey {
+    artist: String,
+    album: String,
+    title: String,
+    size: u64,
+    duration_seconds: u32,
+    track_number: u32,
+    disc_number: u32,
+}
+
+#[derive(Debug)]
 struct SourceTrack {
     path: PathBuf,
-    hash: Hash,
     metadata: Metadata,
+    artwork: Option<Artwork>,
 }
 
 #[derive(Debug)]
 struct ExistingTrack {
     track: Track,
-    hash: Option<Hash>,
+}
+
+#[derive(Debug)]
+struct KeptTrack<'a> {
+    existing: ExistingTrack,
+    source: &'a SourceTrack,
 }
 
 fn main() {
@@ -85,14 +106,19 @@ fn run(cli: Cli) -> Result<()> {
 
     let existing = read_existing_tracks(&database)?;
     let (kept, deleted, copied) = make_plan(&sources, existing);
+    let artwork_updates: Vec<_> = kept
+        .iter()
+        .filter(|entry| !entry.existing.track.has_artwork && entry.source.artwork.is_some())
+        .collect();
 
     println!(
-        "Plan: keep {}, delete {}, copy {}.",
+        "Plan: keep {}, delete {}, copy {}, add artwork to {}.",
         kept.len(),
         deleted.len(),
-        copied.len()
+        copied.len(),
+        artwork_updates.len()
     );
-    print_plan(&deleted, &copied);
+    print_plan(&deleted, &copied, &artwork_updates);
 
     if cli.dry_run {
         println!("Dry run: no files or database entries were changed.");
@@ -126,6 +152,19 @@ fn run(cli: Cli) -> Result<()> {
             .context("failed to save deletions to the iPod database")?;
     }
 
+    for entry in &artwork_updates {
+        let artwork = entry.source.artwork.as_ref().expect("filtered above");
+        println!(
+            "ART    {} — {} ({})",
+            entry.source.metadata.artist, entry.source.metadata.title, artwork.source
+        );
+        database
+            .set_artwork(entry.existing.track.handle, &artwork.data)
+            .with_context(|| {
+                format!("failed to add artwork for {}", entry.source.path.display())
+            })?;
+    }
+
     let mut newly_copied = Vec::new();
     for source in &copied {
         println!(
@@ -134,7 +173,11 @@ fn run(cli: Cli) -> Result<()> {
             source.metadata.title,
             source.path.display()
         );
-        match database.add_track(&source.path, &source.metadata) {
+        let artwork = source
+            .artwork
+            .as_ref()
+            .map(|artwork| artwork.data.as_slice());
+        match database.add_track(&source.path, &source.metadata, artwork) {
             Ok(path) => newly_copied.push(path),
             Err(error) => {
                 remove_uncommitted_files(&newly_copied);
@@ -148,19 +191,21 @@ fn run(cli: Cli) -> Result<()> {
         }
     }
 
-    if !copied.is_empty() {
+    if !copied.is_empty() || !artwork_updates.is_empty() {
         if let Err(error) = database.write().map_err(with_nano_hint) {
             remove_uncommitted_files(&newly_copied);
-            return Err(error)
-                .context("failed to save copied tracks; uncommitted copies were removed");
+            return Err(error).context(
+                "failed to save copied tracks or artwork; uncommitted copies were removed",
+            );
         }
     }
 
     println!(
-        "Done: kept {}, deleted {}, copied {}. Unmount/eject the iPod before unplugging it.",
+        "Done: kept {}, deleted {}, copied {}, added artwork to {}. Unmount/eject the iPod before unplugging it.",
         kept.len(),
         deleted.len(),
-        copied.len()
+        copied.len(),
+        artwork_updates.len()
     );
     Ok(())
 }
@@ -256,67 +301,46 @@ fn scan_sources(libraries: &[PathBuf]) -> Result<(Vec<SourceTrack>, usize)> {
     let mut tracks = Vec::new();
     let mut duplicates = 0;
     for path in paths {
-        let hash = hash_file(&path)
-            .with_context(|| format!("could not hash source file {}", path.display()))?;
-        if !seen.insert(hash) {
+        let track = read_source_track(path)?;
+        if !seen.insert(source_key(&track)) {
             duplicates += 1;
             continue;
         }
-        let metadata = read_metadata(&path)?;
-        tracks.push(SourceTrack {
-            path,
-            hash,
-            metadata,
-        });
+        tracks.push(track);
     }
     Ok((tracks, duplicates))
 }
 
 fn read_existing_tracks(database: &Database) -> Result<Vec<ExistingTrack>> {
     let total = database.track_count();
-    println!("Checking {total} existing iPod track(s)…");
-    let tracks = database.tracks()?;
-    let mut result = Vec::with_capacity(tracks.len());
-    for (index, track) in tracks.into_iter().enumerate() {
-        print!("\rHashing existing iPod tracks: {}/{total}", index + 1);
-        std::io::stdout().flush()?;
-        let hash = match hash_file(&track.path) {
-            Ok(hash) => Some(hash),
-            Err(error)
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                None
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("could not read iPod track {}", track.path.display())
-                });
-            }
-        };
-        result.push(ExistingTrack { track, hash });
-    }
-    if total > 0 {
-        println!();
-    }
-    Ok(result)
+    println!("Checking {total} existing iPod track(s) from iTunesDB…");
+    Ok(database
+        .tracks()?
+        .into_iter()
+        .map(|track| ExistingTrack { track })
+        .collect())
 }
 
-fn make_plan(
-    sources: &[SourceTrack],
+fn make_plan<'a>(
+    sources: &'a [SourceTrack],
     existing: Vec<ExistingTrack>,
-) -> (Vec<ExistingTrack>, Vec<ExistingTrack>, Vec<&SourceTrack>) {
-    let wanted: HashMap<Hash, &SourceTrack> =
-        sources.iter().map(|source| (source.hash, source)).collect();
+) -> (Vec<KeptTrack<'a>>, Vec<ExistingTrack>, Vec<&'a SourceTrack>) {
+    let wanted: HashMap<TrackKey, &SourceTrack> = sources
+        .iter()
+        .map(|source| (source_key(source), source))
+        .collect();
     let mut matched = HashSet::new();
     let mut kept = Vec::new();
     let mut deleted = Vec::new();
 
     for entry in existing {
-        if let Some(hash) = entry.hash {
-            if wanted.contains_key(&hash) && matched.insert(hash) {
-                kept.push(entry);
+        let key = existing_key(&entry.track);
+        if let Some(source) = wanted.get(&key) {
+            if matched.insert(key) {
+                kept.push(KeptTrack {
+                    existing: entry,
+                    source,
+                });
                 continue;
             }
         }
@@ -325,12 +349,16 @@ fn make_plan(
 
     let copied = sources
         .iter()
-        .filter(|source| !matched.contains(&source.hash))
+        .filter(|source| !matched.contains(&source_key(source)))
         .collect();
     (kept, deleted, copied)
 }
 
-fn print_plan(deleted: &[ExistingTrack], copied: &[&SourceTrack]) {
+fn print_plan(
+    deleted: &[ExistingTrack],
+    copied: &[&SourceTrack],
+    artwork_updates: &[&KeptTrack<'_>],
+) {
     for entry in deleted {
         println!("- {}", describe_existing(&entry.track));
     }
@@ -340,6 +368,13 @@ fn print_plan(deleted: &[ExistingTrack], copied: &[&SourceTrack]) {
             source.metadata.artist,
             source.metadata.title,
             source.path.display()
+        );
+    }
+    for entry in artwork_updates {
+        let artwork = entry.source.artwork.as_ref().expect("filtered above");
+        println!(
+            "~ artwork: {} — {} ({})",
+            entry.source.metadata.artist, entry.source.metadata.title, artwork.source
         );
     }
 }
@@ -362,8 +397,8 @@ fn describe_existing(track: &Track) -> String {
     format!("{artist} — {title} ({})", track.path.display())
 }
 
-fn read_metadata(path: &Path) -> Result<Metadata> {
-    let tagged_file = Probe::open(path)
+fn read_source_track(path: PathBuf) -> Result<SourceTrack> {
+    let tagged_file = Probe::open(&path)
         .with_context(|| format!("could not open MP3 metadata: {}", path.display()))?
         .read()
         .with_context(|| format!("could not parse MP3 metadata: {}", path.display()))?;
@@ -371,7 +406,7 @@ fn read_metadata(path: &Path) -> Result<Metadata> {
         .primary_tag()
         .or_else(|| tagged_file.first_tag());
     let properties = tagged_file.properties();
-    let file_metadata = fs::metadata(path)?;
+    let file_metadata = fs::metadata(&path)?;
 
     let fallback_title = path
         .file_stem()
@@ -416,8 +451,7 @@ fn read_metadata(path: &Path) -> Result<Metadata> {
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
         .unwrap_or(0);
-
-    Ok(Metadata {
+    let metadata = Metadata {
         title,
         album,
         artist,
@@ -434,22 +468,130 @@ fn read_metadata(path: &Path) -> Result<Metadata> {
         track_total: tag.and_then(|tag| tag.track_total()).unwrap_or(0),
         disc_number: tag.and_then(|tag| tag.disk()).unwrap_or(0),
         disc_total: tag.and_then(|tag| tag.disk_total()).unwrap_or(0),
+    };
+
+    let embedded = tag.and_then(|tag| {
+        tag.pictures()
+            .iter()
+            .find(|picture| picture.pic_type() == PictureType::CoverFront)
+            .or_else(|| tag.pictures().first())
+    });
+    let artwork = if let Some(picture) = embedded.filter(|picture| !picture.data().is_empty()) {
+        Some(Artwork {
+            data: picture.data().to_vec(),
+            source: format!("embedded in {}", path.display()),
+        })
+    } else {
+        read_external_artwork(&path)?
+    };
+
+    Ok(SourceTrack {
+        path,
+        metadata,
+        artwork,
     })
 }
 
-fn hash_file(path: &Path) -> Result<Hash> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = [0_u8; 128 * 1024];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
+fn read_external_artwork(track_path: &Path) -> Result<Option<Artwork>> {
+    const COVER_NAMES: &[&str] = &[
+        "cover.jpg",
+        "cover.jpeg",
+        "cover.png",
+        "folder.jpg",
+        "folder.jpeg",
+        "folder.png",
+        "front.jpg",
+        "front.jpeg",
+        "front.png",
+    ];
+    let Some(directory) = track_path.parent() else {
+        return Ok(None);
+    };
+
+    let mut files = HashMap::new();
+    for entry in fs::read_dir(directory)
+        .with_context(|| format!("could not scan for artwork in {}", directory.display()))?
+    {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            files.insert(
+                entry.file_name().to_string_lossy().to_lowercase(),
+                entry.path(),
+            );
         }
-        hasher.update(&buffer[..read]);
     }
-    Ok(hasher.finalize())
+
+    for name in COVER_NAMES {
+        if let Some(path) = files.get(*name) {
+            return Ok(Some(Artwork {
+                data: fs::read(path)
+                    .with_context(|| format!("could not read artwork {}", path.display()))?,
+                source: path.display().to_string(),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn source_key(source: &SourceTrack) -> TrackKey {
+    metadata_key(
+        &source.metadata.album_artist,
+        &source.metadata.artist,
+        &source.metadata.album,
+        &source.metadata.title,
+        source.metadata.size,
+        source.metadata.duration_ms,
+        source.metadata.track_number,
+        source.metadata.disc_number,
+    )
+}
+
+fn existing_key(track: &Track) -> TrackKey {
+    metadata_key(
+        &track.album_artist,
+        &track.artist,
+        &track.album,
+        &track.title,
+        track.size,
+        track.duration_ms,
+        track.track_number,
+        track.disc_number,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn metadata_key(
+    album_artist: &str,
+    artist: &str,
+    album: &str,
+    title: &str,
+    size: u64,
+    duration_ms: u32,
+    track_number: u32,
+    disc_number: u32,
+) -> TrackKey {
+    let effective_artist = if album_artist.trim().is_empty() {
+        artist
+    } else {
+        album_artist
+    };
+    TrackKey {
+        artist: normalize_tag(effective_artist),
+        album: normalize_tag(album),
+        title: normalize_tag(title),
+        size,
+        duration_seconds: duration_ms.saturating_add(500) / 1_000,
+        track_number,
+        disc_number,
+    }
+}
+
+fn normalize_tag(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 fn is_mp3(path: &Path) -> bool {
@@ -534,5 +676,40 @@ mod tests {
         );
         assert_eq!(normalize_firewire_guid("not-a-guid"), None);
         assert_eq!(normalize_firewire_guid("000A27001AAE951"), None);
+    }
+
+    #[test]
+    fn track_keys_normalize_tags_but_require_the_same_size() {
+        let first = metadata_key(
+            "",
+            "  Some   Artist ",
+            "ALBUM",
+            "Song",
+            12_345,
+            61_200,
+            2,
+            1,
+        );
+        let same = metadata_key("", "some artist", "album", " song ", 12_345, 61_499, 2, 1);
+        let different_size = metadata_key("", "some artist", "album", "song", 12_346, 61_200, 2, 1);
+
+        assert_eq!(first, same);
+        assert_ne!(first, different_size);
+    }
+
+    #[test]
+    fn finds_external_cover_art_case_insensitively() {
+        let directory =
+            std::env::temp_dir().join(format!("copypod-artwork-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let track = directory.join("song.mp3");
+        fs::write(&track, []).unwrap();
+        fs::write(directory.join("Cover.JPEG"), [1, 2, 3]).unwrap();
+
+        let artwork = read_external_artwork(&track).unwrap().unwrap();
+        assert_eq!(artwork.data, [1, 2, 3]);
+
+        fs::remove_dir_all(directory).unwrap();
     }
 }
