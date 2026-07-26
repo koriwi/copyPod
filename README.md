@@ -29,3 +29,13 @@ Mount the iPod first, then run:
 
 Remove `--dry-run` to sync. `-l` can be used more than once. `-i` must be the
 mount path, not `/dev/sdX`. Eject the iPod before unplugging it.
+
+## FireWire GUID
+
+copyPod checks whether the iPod needs a FireWire GUID and stops before syncing
+if it is missing or invalid. Initialize it with libgpod's helper, using the
+verified whole device for `/dev/sdX`:
+
+```bash
+sudo ipod-read-sysinfo-extended /dev/sdX /run/media/$USER/IPOD
+```

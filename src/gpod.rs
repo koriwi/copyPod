@@ -36,6 +36,8 @@ extern "C" {
     fn cp_db_open(mountpoint: *const c_char, error: *mut *mut c_char) -> *mut CpDb;
     fn cp_db_free(db: *mut CpDb);
     fn cp_db_description(db: *const CpDb) -> *mut c_char;
+    fn cp_db_requires_firewire_guid(db: *const CpDb) -> c_int;
+    fn cp_db_firewire_guid(db: *const CpDb) -> *mut c_char;
     fn cp_db_database_path(db: *const CpDb) -> *mut c_char;
     fn cp_db_track_count(db: *const CpDb) -> usize;
     fn cp_db_tracks(db: *const CpDb) -> *mut CpTrackNode;
@@ -106,6 +108,17 @@ impl Database {
         // SAFETY: self owns a live CpDb.
         let value = unsafe { cp_db_description(self.raw.as_ptr()) };
         take_string(value).unwrap_or_else(|| "unknown iPod".to_owned())
+    }
+
+    pub fn requires_firewire_guid(&self) -> bool {
+        // SAFETY: self owns a live CpDb.
+        unsafe { cp_db_requires_firewire_guid(self.raw.as_ptr()) != 0 }
+    }
+
+    pub fn firewire_guid(&self) -> Option<String> {
+        // SAFETY: self owns a live CpDb.
+        let value = unsafe { cp_db_firewire_guid(self.raw.as_ptr()) };
+        take_string(value)
     }
 
     pub fn database_path(&self) -> Result<PathBuf> {

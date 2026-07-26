@@ -31,6 +31,8 @@ CpDb *cp_db_open(const char *mountpoint, char **error);
 void cp_db_free(CpDb *db);
 
 char *cp_db_description(const CpDb *db);
+int cp_db_requires_firewire_guid(const CpDb *db);
+char *cp_db_firewire_guid(const CpDb *db);
 char *cp_db_database_path(const CpDb *db);
 size_t cp_db_track_count(const CpDb *db);
 CpTrackNode *cp_db_tracks(const CpDb *db);

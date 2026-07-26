@@ -81,6 +81,7 @@ fn run(cli: Cli) -> Result<()> {
         )
     })?;
     println!("Device: {}", database.description());
+    check_firewire_guid(&database, &ipod)?;
 
     let existing = read_existing_tracks(&database)?;
     let (kept, deleted, copied) = make_plan(&sources, existing);
@@ -102,8 +103,8 @@ fn run(cli: Cli) -> Result<()> {
     let backup_path = backup_database(&database_path)?;
     println!("Database backup: {}", backup_path.display());
 
-    // An unchanged write catches missing Nano 3G FireWire GUID/hash support
-    // before copyPod deletes any files.
+    // Verify that libgpod can sign and write this device's database before
+    // copyPod deletes any files.
     database
         .write()
         .map_err(with_nano_hint)
@@ -162,6 +163,41 @@ fn run(cli: Cli) -> Result<()> {
         copied.len()
     );
     Ok(())
+}
+
+fn check_firewire_guid(database: &Database, ipod: &Path) -> Result<()> {
+    if !database.requires_firewire_guid() {
+        println!("FireWire GUID: not required");
+        return Ok(());
+    }
+
+    let Some(raw_guid) = database.firewire_guid() else {
+        bail!(
+            "this iPod requires a FireWire GUID, but none was found in SysInfo or SysInfoExtended\n\
+             Initialize it, then rerun copyPod:\n  sudo ipod-read-sysinfo-extended /dev/sdX {}",
+            ipod.display()
+        );
+    };
+    let guid = normalize_firewire_guid(&raw_guid).ok_or_else(|| {
+        anyhow!(
+            "this iPod requires a FireWire GUID, but `{raw_guid}` is invalid\n\
+             Regenerate it, then rerun copyPod:\n  sudo ipod-read-sysinfo-extended /dev/sdX {}",
+            ipod.display()
+        )
+    })?;
+
+    println!("FireWire GUID: required, present ({guid})");
+    Ok(())
+}
+
+fn normalize_firewire_guid(value: &str) -> Option<String> {
+    let value = value.trim();
+    let value = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    (value.len() == 16 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| value.to_ascii_uppercase())
 }
 
 fn validate_libraries(libraries: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -484,5 +520,19 @@ mod tests {
         assert!(is_unsupported_audio(Path::new("song.flac")));
         assert!(is_unsupported_audio(Path::new("song.M4A")));
         assert!(!is_unsupported_audio(Path::new("cover.jpg")));
+    }
+
+    #[test]
+    fn validates_and_normalizes_firewire_guids() {
+        assert_eq!(
+            normalize_firewire_guid("0x000a27001aae9513"),
+            Some("000A27001AAE9513".to_owned())
+        );
+        assert_eq!(
+            normalize_firewire_guid("000A27001AAE9513"),
+            Some("000A27001AAE9513".to_owned())
+        );
+        assert_eq!(normalize_firewire_guid("not-a-guid"), None);
+        assert_eq!(normalize_firewire_guid("000A27001AAE951"), None);
     }
 }

@@ -79,6 +79,39 @@ char *cp_db_description(const CpDb *db) {
                            model != NULL ? " / " : "", model != NULL ? model : "");
 }
 
+int cp_db_requires_firewire_guid(const CpDb *db) {
+    if (db == NULL || db->itdb == NULL || db->itdb->device == NULL) {
+        return 0;
+    }
+
+    const Itdb_IpodInfo *info = itdb_device_get_ipod_info(db->itdb->device);
+    if (info == NULL) {
+        return 0;
+    }
+
+    switch (info->ipod_generation) {
+        case ITDB_IPOD_GENERATION_CLASSIC_1:
+        case ITDB_IPOD_GENERATION_CLASSIC_2:
+        case ITDB_IPOD_GENERATION_CLASSIC_3:
+        case ITDB_IPOD_GENERATION_NANO_3:
+        case ITDB_IPOD_GENERATION_NANO_4:
+        case ITDB_IPOD_GENERATION_NANO_5:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+char *cp_db_firewire_guid(const CpDb *db) {
+    if (db == NULL || db->itdb == NULL || db->itdb->device == NULL) {
+        return NULL;
+    }
+
+    /* libgpod copies FireWireGUID from SysInfoExtended into this SysInfo
+       property while opening the device, so this covers both file formats. */
+    return itdb_device_get_sysinfo(db->itdb->device, "FirewireGuid");
+}
+
 char *cp_db_database_path(const CpDb *db) {
     if (db == NULL || db->itdb == NULL) {
         return NULL;
