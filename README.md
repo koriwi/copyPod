@@ -1,5 +1,8 @@
 # copyPod
 
+> [!CAUTION]
+> **This project is vibecoded. Back up your iPod and use it at your own risk.**
+
 copyPod is a small Linux command-line tool for putting MP3s on an iPod running
 Apple's original firmware. Give it one or more music folders and the iPod's
 mount point; copyPod scans the folders recursively and makes the iPod's music
