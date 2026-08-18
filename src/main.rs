@@ -125,12 +125,6 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
-    // Refuse before deleting or copying media until libopod can stage, sign,
-    // validate, and recover a complete multi-file commit for this profile.
-    database
-        .write()
-        .context("libopod write preflight failed; no music files have been changed")?;
-
     for entry in &deleted {
         println!("DELETE {}", describe_existing(&entry.track));
         database
@@ -138,7 +132,7 @@ fn run(cli: Cli) -> Result<()> {
             .with_context(|| format!("failed to delete {}", entry.track.path.display()))?;
     }
 
-    // Commit deletion separately. If a subsequent copy fails, the database and
+    // Commit deletions separately. If a subsequent copy fails, the database and
     // filesystem still agree and rerunning copyPod can finish the mirror.
     if !deleted.is_empty() {
         database
@@ -146,6 +140,8 @@ fn run(cli: Cli) -> Result<()> {
             .context("failed to save deletions to the iPod database")?;
     }
 
+    // Tracks kept without artwork but with artwork in the source are replaced
+    // by a fresh indexed entry carrying the artwork.
     for entry in &artwork_updates {
         let artwork = entry.source.artwork.as_ref().expect("filtered above");
         println!(
@@ -153,13 +149,17 @@ fn run(cli: Cli) -> Result<()> {
             entry.source.metadata.artist, entry.source.metadata.title, artwork.source
         );
         database
-            .set_artwork(entry.existing.track.handle, &artwork.data)
+            .remove_track(entry.existing.track.handle)
+            .with_context(|| {
+                format!("failed to replace {}", entry.source.path.display())
+            })?;
+        database
+            .add_track(&entry.source.path, &entry.source.metadata, Some(&artwork.data))
             .with_context(|| {
                 format!("failed to add artwork for {}", entry.source.path.display())
             })?;
     }
 
-    let mut newly_copied = Vec::new();
     for source in &copied {
         println!(
             "COPY   {} — {} ({})",
@@ -171,28 +171,16 @@ fn run(cli: Cli) -> Result<()> {
             .artwork
             .as_ref()
             .map(|artwork| artwork.data.as_slice());
-        match database.add_track(&source.path, &source.metadata, artwork) {
-            Ok(path) => newly_copied.push(path),
-            Err(error) => {
-                remove_uncommitted_files(&newly_copied);
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to copy {}; rerun copyPod to retry",
-                        source.path.display()
-                    )
-                });
-            }
-        }
+        database
+            .add_track(&source.path, &source.metadata, artwork)
+            .with_context(|| {
+                format!("failed to copy {}; rerun copyPod to retry", source.path.display())
+            })?;
     }
 
-    if !copied.is_empty() || !artwork_updates.is_empty() {
-        if let Err(error) = database.write() {
-            remove_uncommitted_files(&newly_copied);
-            return Err(error).context(
-                "failed to save copied tracks or artwork; uncommitted copies were removed",
-            );
-        }
-    }
+    database
+        .write()
+        .context("failed to commit copied tracks or artwork to the iPod database")?;
 
     println!(
         "Done: kept {}, deleted {}, copied {}, added artwork to {}. Unmount/eject the iPod before unplugging it.",
@@ -589,16 +577,6 @@ fn is_unsupported_audio(path: &Path) -> bool {
         })
 }
 
-fn remove_uncommitted_files(paths: &[PathBuf]) {
-    for path in paths {
-        if let Err(error) = fs::remove_file(path) {
-            eprintln!(
-                "warning: could not remove uncommitted copy {}: {error}",
-                path.display()
-            );
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

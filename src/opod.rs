@@ -1,17 +1,19 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use libopod::{ChecksumKind, Device, PersistentId};
+use libopod::{ChecksumKind, Device, MediaDeletionPolicy, PersistentId, TrackToAdd};
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Metadata {
     pub title: String,
     pub album: String,
     pub artist: String,
     pub album_artist: String,
     pub genre: String,
+    #[allow(dead_code)] // kept for API parity; not read by the mirror planner
     pub comment: String,
     pub size: u64,
+    #[allow(dead_code)] // kept for API parity; not read by the mirror planner
     pub modified_at: i64,
     pub duration_ms: u32,
     pub bitrate_kbps: u32,
@@ -41,8 +43,23 @@ pub struct Track {
     pub has_artwork: bool,
 }
 
+/// One queued library change, committed by [`Database::write`].
+enum PendingChange {
+    Remove(PersistentId),
+    Add(Box<PendingAdd>),
+}
+
+struct PendingAdd {
+    source: PathBuf,
+    metadata: Metadata,
+    artwork: Option<Vec<u8>>,
+}
+
 pub struct Database {
+    mountpoint: PathBuf,
     device: Device,
+    pending: Vec<PendingChange>,
+    artwork_sequence: u64,
 }
 
 impl Database {
@@ -51,7 +68,12 @@ impl Database {
         if device.library().is_none() {
             bail!("libopod does not yet have a read adapter for this device profile");
         }
-        Ok(Self { device })
+        Ok(Self {
+            mountpoint: mountpoint.to_path_buf(),
+            device,
+            pending: Vec::new(),
+            artwork_sequence: 0,
+        })
     }
 
     pub fn description(&self) -> String {
@@ -106,46 +128,114 @@ impl Database {
             .collect()
     }
 
+    /// Queues a track removal. The media file is deleted as part of the
+    /// commit (libopod backs it up and restores it on rollback).
     pub fn remove_track(&mut self, track: TrackHandle) -> Result<()> {
-        let _persistent_id = track.0;
-        bail!("libopod track removal is not implemented; no device files were changed")
+        let present = self.device.library().is_some_and(|library| {
+            library.tracks().iter().any(|existing| existing.id == track.0)
+        });
+        if !present {
+            bail!("track is not present in the opened library");
+        }
+        self.pending.push(PendingChange::Remove(track.0));
+        Ok(())
     }
 
-    pub fn set_artwork(&mut self, track: TrackHandle, artwork: &[u8]) -> Result<()> {
-        let (_persistent_id, _artwork) = (track.0, artwork);
-        bail!("libopod artwork updates are not implemented; no device files were changed")
-    }
-
+    /// Queues a track addition. When `artwork` is present it is encoded into
+    /// the device's cover formats as part of the commit.
     pub fn add_track(
         &mut self,
         source: &Path,
         metadata: &Metadata,
         artwork: Option<&[u8]>,
-    ) -> Result<PathBuf> {
-        let _future_write_input = (
-            source,
-            &metadata.title,
-            &metadata.album,
-            &metadata.artist,
-            &metadata.album_artist,
-            &metadata.genre,
-            &metadata.comment,
-            metadata.size,
-            metadata.modified_at,
-            metadata.duration_ms,
-            metadata.bitrate_kbps,
-            metadata.sample_rate_hz,
-            metadata.year,
-            metadata.track_number,
-            metadata.track_total,
-            metadata.disc_number,
-            metadata.disc_total,
-            artwork,
-        );
-        bail!("libopod track addition is not implemented; no device files were changed")
+    ) -> Result<()> {
+        if !source.is_file() {
+            bail!("track source is not a regular file: {}", source.display());
+        }
+        self.pending.push(PendingChange::Add(Box::new(PendingAdd {
+            source: source.to_path_buf(),
+            metadata: metadata.clone(),
+            artwork: artwork.map(<[u8]>::to_vec),
+        })));
+        Ok(())
     }
 
+    /// Commits every queued change as one staged, signed, recoverable
+    /// transaction. A no-op when nothing is queued.
     pub fn write(&mut self) -> Result<()> {
-        bail!("libopod commits are not implemented; no device files were changed")
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let mut edit = self
+            .device
+            .edit()
+            .context("libopod could not start an edit session")?;
+        edit.set_media_policy(MediaDeletionPolicy::Delete);
+        for change in std::mem::take(&mut self.pending) {
+            match change {
+                PendingChange::Remove(id) => {
+                    edit.remove_track(id).context("queue track removal")?;
+                }
+                PendingChange::Add(change) => {
+                    let artwork_source = match change.artwork {
+                        Some(bytes) => {
+                            self.artwork_sequence = self.artwork_sequence.wrapping_add(1);
+                            let artwork_file = std::env::temp_dir().join(format!(
+                                "copyPod-{}-{}.art",
+                                std::process::id(),
+                                self.artwork_sequence
+                            ));
+                            std::fs::write(&artwork_file, &bytes).with_context(|| {
+                                format!("write temporary artwork for {}", change.source.display())
+                            })?;
+                            Some(artwork_file)
+                        }
+                        None => None,
+                    };
+                    let addition = TrackToAdd {
+                        source_path: change.source.clone(),
+                        title: change.metadata.title.clone(),
+                        artist: non_empty(&change.metadata.artist),
+                        album: non_empty(&change.metadata.album),
+                        album_artist: non_empty(&change.metadata.album_artist),
+                        genre: non_empty(&change.metadata.genre),
+                        composer: None,
+                        year: change.metadata.year,
+                        track_number: change.metadata.track_number,
+                        total_tracks: change.metadata.track_total,
+                        disc_number: change.metadata.disc_number,
+                        total_discs: change.metadata.disc_total,
+                        bitrate: change.metadata.bitrate_kbps,
+                        sample_rate: change.metadata.sample_rate_hz,
+                        length_ms: change.metadata.duration_ms,
+                        compilation: false,
+                        reuse_album_art: false,
+                        artwork_source,
+                    };
+                    edit.add_track(addition)
+                        .context("queue track addition")?;
+                }
+            }
+        }
+        let staging = tempfile::tempdir().context("create staging directory")?;
+        let staged = edit
+            .stage_sqlite_preview(staging.path())
+            .context("stage database changes")?;
+        staged
+            .install(&self.device)
+            .context("install staged changes; rerun copyPod to retry")?;
+        // The commit rewrote the device databases; refresh the cached device
+        // (generation fingerprint, library) for the next write cycle.
+        self.device =
+            Device::open(&self.mountpoint).context("reopen the iPod after the commit")?;
+        Ok(())
+    }
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value.trim().to_owned())
     }
 }
