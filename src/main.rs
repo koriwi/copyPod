@@ -1,11 +1,11 @@
-mod gpod;
+mod opod;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::picture::PictureType;
@@ -13,7 +13,7 @@ use lofty::prelude::Accessor;
 use lofty::probe::Probe;
 use walkdir::WalkDir;
 
-use crate::gpod::{Database, Metadata, Track};
+use crate::opod::{Database, Metadata, Track};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -125,16 +125,11 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
-    let database_path = database.database_path()?;
-    let backup_path = backup_database(&database_path)?;
-    println!("Database backup: {}", backup_path.display());
-
-    // Verify that libgpod can sign and write this device's database before
-    // copyPod deletes any files.
+    // Refuse before deleting or copying media until libopod can stage, sign,
+    // validate, and recover a complete multi-file commit for this profile.
     database
         .write()
-        .map_err(with_nano_hint)
-        .context("iPod preflight write failed; no music files have been changed")?;
+        .context("libopod write preflight failed; no music files have been changed")?;
 
     for entry in &deleted {
         println!("DELETE {}", describe_existing(&entry.track));
@@ -148,7 +143,6 @@ fn run(cli: Cli) -> Result<()> {
     if !deleted.is_empty() {
         database
             .write()
-            .map_err(with_nano_hint)
             .context("failed to save deletions to the iPod database")?;
     }
 
@@ -192,7 +186,7 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     if !copied.is_empty() || !artwork_updates.is_empty() {
-        if let Err(error) = database.write().map_err(with_nano_hint) {
+        if let Err(error) = database.write() {
             remove_uncommitted_files(&newly_copied);
             return Err(error).context(
                 "failed to save copied tracks or artwork; uncommitted copies were removed",
@@ -215,34 +209,16 @@ fn check_firewire_guid(database: &Database, ipod: &Path) -> Result<()> {
         println!("FireWire GUID: not required");
         return Ok(());
     }
-
-    let Some(raw_guid) = database.firewire_guid() else {
+    if !database.has_firewire_guid() {
         bail!(
             "this iPod requires a FireWire GUID, but none was found in SysInfo or SysInfoExtended\n\
              Initialize it, then rerun copyPod:\n  sudo ipod-read-sysinfo-extended /dev/sdX {}",
             ipod.display()
         );
-    };
-    let guid = normalize_firewire_guid(&raw_guid).ok_or_else(|| {
-        anyhow!(
-            "this iPod requires a FireWire GUID, but `{raw_guid}` is invalid\n\
-             Regenerate it, then rerun copyPod:\n  sudo ipod-read-sysinfo-extended /dev/sdX {}",
-            ipod.display()
-        )
-    })?;
+    }
 
-    println!("FireWire GUID: required, present ({guid})");
+    println!("FireWire GUID: required and present (value redacted)");
     Ok(())
-}
-
-fn normalize_firewire_guid(value: &str) -> Option<String> {
-    let value = value.trim();
-    let value = value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-        .unwrap_or(value);
-    (value.len() == 16 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .then(|| value.to_ascii_uppercase())
 }
 
 fn validate_libraries(libraries: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -313,7 +289,7 @@ fn scan_sources(libraries: &[PathBuf]) -> Result<(Vec<SourceTrack>, usize)> {
 
 fn read_existing_tracks(database: &Database) -> Result<Vec<ExistingTrack>> {
     let total = database.track_count();
-    println!("Checking {total} existing iPod track(s) from iTunesDB…");
+    println!("Checking {total} existing iPod track(s) from the authoritative library…");
     Ok(database
         .tracks()?
         .into_iter()
@@ -613,22 +589,6 @@ fn is_unsupported_audio(path: &Path) -> bool {
         })
 }
 
-fn backup_database(database_path: &Path) -> Result<PathBuf> {
-    let filename = database_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow!("invalid iTunesDB path: {}", database_path.display()))?;
-    let backup = database_path.with_file_name(format!("{filename}.copyPod-backup"));
-    fs::copy(database_path, &backup).with_context(|| {
-        format!(
-            "could not back up {} to {}",
-            database_path.display(),
-            backup.display()
-        )
-    })?;
-    Ok(backup)
-}
-
 fn remove_uncommitted_files(paths: &[PathBuf]) {
     for path in paths {
         if let Err(error) = fs::remove_file(path) {
@@ -638,12 +598,6 @@ fn remove_uncommitted_files(paths: &[PathBuf]) {
             );
         }
     }
-}
-
-fn with_nano_hint(error: anyhow::Error) -> anyhow::Error {
-    anyhow!(
-        "{error:#}\nFor a Nano 3G, make sure iPod_Control/Device/SysInfoExtended contains its FireWire GUID. The one-time setup is:\n  sudo ipod-read-sysinfo-extended /dev/sdX /path/to/mounted/ipod"
-    )
 }
 
 #[cfg(test)]
@@ -662,20 +616,6 @@ mod tests {
         assert!(is_unsupported_audio(Path::new("song.flac")));
         assert!(is_unsupported_audio(Path::new("song.M4A")));
         assert!(!is_unsupported_audio(Path::new("cover.jpg")));
-    }
-
-    #[test]
-    fn validates_and_normalizes_firewire_guids() {
-        assert_eq!(
-            normalize_firewire_guid("0x000a27001aae9513"),
-            Some("000A27001AAE9513".to_owned())
-        );
-        assert_eq!(
-            normalize_firewire_guid("000A27001AAE9513"),
-            Some("000A27001AAE9513".to_owned())
-        );
-        assert_eq!(normalize_firewire_guid("not-a-guid"), None);
-        assert_eq!(normalize_firewire_guid("000A27001AAE951"), None);
     }
 
     #[test]
