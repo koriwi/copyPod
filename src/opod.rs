@@ -92,6 +92,14 @@ impl Database {
         })
     }
 
+    /// Whether this device can store cover artwork. Nano 1G/2G cannot, so
+    /// the mirror planner skips artwork instead of failing the commit.
+    pub fn supports_artwork(&self) -> bool {
+        self.device
+            .profile()
+            .is_some_and(|profile| profile.capabilities().supports_artwork())
+    }
+
     pub fn has_firewire_guid(&self) -> bool {
         self.device.evidence().has_firewire_guid()
     }

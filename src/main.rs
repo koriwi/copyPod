@@ -106,9 +106,13 @@ fn run(cli: Cli) -> Result<()> {
 
     let existing = read_existing_tracks(&database)?;
     let (kept, deleted, copied) = make_plan(&sources, existing);
+    // Devices without writable cover formats (Nano 1G/2G) cannot store
+    // artwork at all; embedded source art is left out instead of failing.
+    let artwork_capable = database.supports_artwork();
     let artwork_updates: Vec<_> = kept
         .iter()
         .filter(|entry| !entry.existing.track.has_artwork && entry.source.artwork.is_some())
+        .filter(|_| artwork_capable)
         .collect();
 
     println!(
@@ -118,6 +122,12 @@ fn run(cli: Cli) -> Result<()> {
         copied.len(),
         artwork_updates.len()
     );
+    if !artwork_capable
+        && (kept.iter().any(|entry| entry.source.artwork.is_some())
+            || copied.iter().any(|source| source.artwork.is_some()))
+    {
+        println!("       (embedded artwork ignored: this device cannot store cover art)");
+    }
     print_plan(&deleted, &copied, &artwork_updates);
 
     if cli.dry_run {
@@ -167,10 +177,14 @@ fn run(cli: Cli) -> Result<()> {
             source.metadata.title,
             source.path.display()
         );
-        let artwork = source
-            .artwork
-            .as_ref()
-            .map(|artwork| artwork.data.as_slice());
+        let artwork = if artwork_capable {
+            source
+                .artwork
+                .as_ref()
+                .map(|artwork| artwork.data.as_slice())
+        } else {
+            None
+        };
         database
             .add_track(&source.path, &source.metadata, artwork)
             .with_context(|| {
