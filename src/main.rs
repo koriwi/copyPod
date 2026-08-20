@@ -375,15 +375,24 @@ fn read_source_playlists(
     paths: &[PathBuf],
     keys_by_path: &HashMap<PathBuf, TrackKey>,
 ) -> Result<Vec<SourcePlaylist>> {
-    let mut seen_names = HashMap::<String, PathBuf>::new();
-    let mut playlists = Vec::new();
+    let mut seen_names = HashMap::<String, usize>::new();
+    let mut playlists: Vec<SourcePlaylist> = Vec::new();
     for path in paths {
-        let name = path
+        let stem = path
             .file_stem()
             .and_then(|name| name.to_str())
             .filter(|name| !name.trim().is_empty())
-            .with_context(|| format!("playlist has no valid UTF-8 name: {}", path.display()))?
-            .to_owned();
+            .with_context(|| format!("playlist has no valid UTF-8 name: {}", path.display()))?;
+        // rocksonic-rs prefixes generated M3U filenames with `000 ` to sort
+        // them first. It is not part of the user-facing playlist name.
+        let name = stem.strip_prefix("000 ").unwrap_or(stem);
+        if name.trim().is_empty() {
+            bail!(
+                "playlist has no name after its 000 prefix: {}",
+                path.display()
+            );
+        }
+        let name = name.to_owned();
         if name.encode_utf16().count() > 255 {
             bail!(
                 "playlist name exceeds 255 UTF-16 code units: {}",
@@ -391,13 +400,6 @@ fn read_source_playlists(
             );
         }
         let normalized_name = normalize_playlist_name(&name);
-        if let Some(previous) = seen_names.insert(normalized_name, path.clone()) {
-            bail!(
-                "M3U playlists must have unique names (case-insensitive): {} and {}",
-                previous.display(),
-                path.display()
-            );
-        }
 
         let bytes = fs::read(path)
             .with_context(|| format!("could not read M3U playlist: {}", path.display()))?;
@@ -435,6 +437,23 @@ fn read_source_playlists(
             })?;
             tracks.push(key.clone());
         }
+        if let Some(&previous_index) = seen_names.get(&normalized_name) {
+            let previous = &playlists[previous_index];
+            if previous.tracks == tracks {
+                eprintln!(
+                    "warning: duplicate M3U playlist ignored: {} (same iPod name and tracks as {})",
+                    path.display(),
+                    previous.path.display()
+                );
+                continue;
+            }
+            bail!(
+                "M3U playlists resolve to the same iPod name but contain different tracks: {} and {}",
+                previous.path.display(),
+                path.display()
+            );
+        }
+        seen_names.insert(normalized_name, playlists.len());
         playlists.push(SourcePlaylist {
             name,
             path: path.clone(),
@@ -498,12 +517,23 @@ fn make_playlist_plan<'a>(
     let mut matched = HashSet::new();
 
     for source in sources {
-        let existing_playlist = existing.iter().find(|playlist| {
-            !playlist.is_hidden
-                && !playlist.is_smart
-                && !matched.contains(&playlist.handle)
-                && normalize_playlist_name(&playlist.name) == normalize_playlist_name(&source.name)
-        });
+        let desired_name = normalize_playlist_name(&source.name);
+        let editable = |playlist: &&Playlist| {
+            !playlist.is_hidden && !playlist.is_smart && !matched.contains(&playlist.handle)
+        };
+        // Prefer an exact name. As a migration path, also recognize playlists
+        // created by older copyPod versions with rocksonic-rs's `000 ` prefix.
+        let existing_playlist = existing
+            .iter()
+            .filter(editable)
+            .find(|playlist| normalize_playlist_name(&playlist.name) == desired_name)
+            .or_else(|| {
+                existing.iter().filter(editable).find(|playlist| {
+                    normalize_playlist_name(&playlist.name)
+                        .strip_prefix("000 ")
+                        .is_some_and(|name| name == desired_name)
+                })
+            });
         let Some(existing_playlist) = existing_playlist else {
             created.push(source);
             continue;
@@ -928,7 +958,7 @@ mod tests {
         let second = directory.join("music/two.mp3");
         fs::write(&first, []).unwrap();
         fs::write(&second, []).unwrap();
-        let playlist_path = directory.join("Road Trip.m3u8");
+        let playlist_path = directory.join("000 Road Trip.m3u8");
         fs::write(
             &playlist_path,
             b"\xef\xbb\xbf#EXTM3U\n#EXTINF:1,One\nmusic/one.mp3\n\n music/two.mp3 \nmusic/one.mp3\n",
