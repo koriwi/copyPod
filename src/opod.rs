@@ -31,6 +31,20 @@ pub struct TrackHandle(PersistentId);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct PlaylistHandle(PersistentId);
 
+#[cfg(test)]
+impl TrackHandle {
+    pub(crate) fn from_test_bits(bits: u64) -> Self {
+        Self(PersistentId::from_bits(bits))
+    }
+}
+
+#[cfg(test)]
+impl PlaylistHandle {
+    pub(crate) fn from_test_bits(bits: u64) -> Self {
+        Self(PersistentId::from_bits(bits))
+    }
+}
+
 #[derive(Debug)]
 pub struct Track {
     pub handle: TrackHandle,
@@ -68,6 +82,7 @@ enum PendingChange {
         name: String,
         tracks: Vec<PersistentId>,
     },
+    DeletePlaylist(PersistentId),
 }
 
 struct PendingAdd {
@@ -257,6 +272,20 @@ impl Database {
         Ok(())
     }
 
+    /// Queues deletion of a standard playlist without deleting its tracks.
+    pub fn delete_playlist(&mut self, playlist: PlaylistHandle) -> Result<()> {
+        let editable = self.device.library().is_some_and(|library| {
+            library.playlists().iter().any(|existing| {
+                existing.id == playlist.0 && !existing.is_hidden && !existing.is_smart
+            })
+        });
+        if !editable {
+            bail!("playlist is absent, hidden, or smart and cannot be deleted");
+        }
+        self.pending.push(PendingChange::DeletePlaylist(playlist.0));
+        Ok(())
+    }
+
     /// Commits every queued change as one staged, signed, recoverable
     /// transaction. A no-op when nothing is queued.
     pub fn write(&mut self) -> Result<()> {
@@ -320,6 +349,10 @@ impl Database {
                         .context("queue playlist rename")?;
                     edit.set_playlist_tracks(id, &tracks)
                         .context("queue playlist membership update")?;
+                }
+                PendingChange::DeletePlaylist(id) => {
+                    edit.delete_playlist(id)
+                        .context("queue playlist deletion")?;
                 }
             }
         }

@@ -84,11 +84,18 @@ struct PlaylistUpdate<'a> {
     handle: PlaylistHandle,
 }
 
+#[derive(Debug)]
+struct PlaylistDeletion {
+    name: String,
+    handle: PlaylistHandle,
+}
+
 #[derive(Debug, Default)]
 struct PlaylistPlan<'a> {
     kept: Vec<&'a SourcePlaylist>,
     created: Vec<&'a SourcePlaylist>,
     updated: Vec<PlaylistUpdate<'a>>,
+    deleted: Vec<PlaylistDeletion>,
 }
 
 fn main() {
@@ -156,14 +163,15 @@ fn run(cli: Cli) -> Result<()> {
         .collect();
 
     println!(
-        "Plan: keep {}, delete {}, copy {}, add artwork to {}; keep {} playlist(s), create {}, update {}.",
+        "Plan: keep {}, delete {}, copy {}, add artwork to {}; keep {} playlist(s), create {}, update {}, delete {} obsolete prefixed playlist(s).",
         kept.len(),
         deleted.len(),
         copied.len(),
         artwork_updates.len(),
         playlist_plan.kept.len(),
         playlist_plan.created.len(),
-        playlist_plan.updated.len()
+        playlist_plan.updated.len(),
+        playlist_plan.deleted.len()
     );
     if !artwork_capable
         && (kept.iter().any(|entry| entry.source.artwork.is_some())
@@ -269,13 +277,14 @@ fn run(cli: Cli) -> Result<()> {
     };
 
     println!(
-        "Done: kept {}, deleted {}, copied {}, added artwork to {}; created {} playlist(s), updated {}. Unmount/eject the iPod before unplugging it.",
+        "Done: kept {}, deleted {}, copied {}, added artwork to {}; created {} playlist(s), updated {}, deleted {} obsolete prefixed playlist(s). Unmount/eject the iPod before unplugging it.",
         kept.len(),
         deleted.len(),
         copied.len(),
         artwork_updates.len(),
         playlist_plan.created.len(),
-        playlist_plan.updated.len()
+        playlist_plan.updated.len(),
+        playlist_plan.deleted.len()
     );
     Ok(())
 }
@@ -514,6 +523,7 @@ fn make_playlist_plan<'a>(
     let mut kept = Vec::new();
     let mut created = Vec::new();
     let mut updated = Vec::new();
+    let mut deleted = Vec::new();
     let mut matched = HashSet::new();
 
     for source in sources {
@@ -521,19 +531,37 @@ fn make_playlist_plan<'a>(
         let editable = |playlist: &&Playlist| {
             !playlist.is_hidden && !playlist.is_smart && !matched.contains(&playlist.handle)
         };
-        // Prefer an exact name. As a migration path, also recognize playlists
-        // created by older copyPod versions with rocksonic-rs's `000 ` prefix.
-        let existing_playlist = existing
+        let exact = existing
             .iter()
             .filter(editable)
-            .find(|playlist| normalize_playlist_name(&playlist.name) == desired_name)
-            .or_else(|| {
-                existing.iter().filter(editable).find(|playlist| {
-                    normalize_playlist_name(&playlist.name)
-                        .strip_prefix("000 ")
-                        .is_some_and(|name| name == desired_name)
-                })
+            .find(|playlist| normalize_playlist_name(&playlist.name) == desired_name);
+        let legacy: Vec<_> = existing
+            .iter()
+            .filter(editable)
+            .filter(|playlist| {
+                normalize_playlist_name(&playlist.name)
+                    .strip_prefix("000 ")
+                    .is_some_and(|name| name == desired_name)
+            })
+            .collect();
+
+        // If both names exist, keep the correctly named playlist and remove
+        // every obsolete prefixed copy. If only a prefixed playlist exists,
+        // update the first one in place and remove any duplicates.
+        let legacy_to_delete = if exact.is_some() {
+            &legacy[..]
+        } else {
+            &legacy[1.min(legacy.len())..]
+        };
+        for playlist in legacy_to_delete {
+            matched.insert(playlist.handle);
+            deleted.push(PlaylistDeletion {
+                name: playlist.name.clone(),
+                handle: playlist.handle,
             });
+        }
+
+        let existing_playlist = exact.or_else(|| legacy.first().copied());
         let Some(existing_playlist) = existing_playlist else {
             created.push(source);
             continue;
@@ -560,6 +588,7 @@ fn make_playlist_plan<'a>(
         kept,
         created,
         updated,
+        deleted,
     }
 }
 
@@ -568,6 +597,12 @@ fn apply_playlist_plan(
     plan: &PlaylistPlan<'_>,
     handles_by_key: &HashMap<TrackKey, TrackHandle>,
 ) -> Result<()> {
+    for playlist in &plan.deleted {
+        println!("PLAYLIST - {}", playlist.name);
+        database
+            .delete_playlist(playlist.handle)
+            .with_context(|| format!("failed to delete obsolete playlist {}", playlist.name))?;
+    }
     for source in &plan.created {
         let tracks = resolve_playlist_handles(source, handles_by_key)?;
         println!("PLAYLIST + {} ({})", source.name, source.path.display());
@@ -633,6 +668,9 @@ fn print_plan(
 }
 
 fn print_playlist_plan(plan: &PlaylistPlan<'_>) {
+    for playlist in &plan.deleted {
+        println!("- obsolete playlist: {}", playlist.name);
+    }
     for source in &plan.created {
         println!("+ playlist: {} ({})", source.name, source.path.display());
     }
@@ -946,6 +984,42 @@ mod tests {
         let track_artist = metadata_key("", "Artist", "Album", "Song", 1, 1, 0, 0);
 
         assert_eq!(album_artist, track_artist);
+    }
+
+    #[test]
+    fn removes_obsolete_prefixed_playlist_when_clean_name_exists() {
+        let track_key = metadata_key("", "Artist", "Album", "Song", 1, 1, 0, 0);
+        let track = TrackHandle::from_test_bits(1);
+        let clean = PlaylistHandle::from_test_bits(2);
+        let prefixed = PlaylistHandle::from_test_bits(3);
+        let source = SourcePlaylist {
+            name: "Road Trip".to_owned(),
+            path: PathBuf::from("000 Road Trip.m3u"),
+            tracks: vec![track_key.clone()],
+        };
+        let existing = vec![
+            Playlist {
+                handle: prefixed,
+                name: "000 Road Trip".to_owned(),
+                tracks: vec![track],
+                is_hidden: false,
+                is_smart: false,
+            },
+            Playlist {
+                handle: clean,
+                name: "Road Trip".to_owned(),
+                tracks: vec![track],
+                is_hidden: false,
+                is_smart: false,
+            },
+        ];
+        let sources = [source];
+        let plan = make_playlist_plan(&sources, existing, &HashMap::from([(track, track_key)]));
+
+        assert_eq!(plan.kept.len(), 1);
+        assert!(plan.updated.is_empty());
+        assert_eq!(plan.deleted.len(), 1);
+        assert_eq!(plan.deleted[0].handle, prefixed);
     }
 
     #[test]

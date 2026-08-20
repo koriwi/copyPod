@@ -91,8 +91,8 @@ recursively; its directory layout is not copied to the iPod.
 
 M3U and M3U8 files within those folders become standard iPod playlists. The
 playlist filename (without its extension) becomes the playlist name; copyPod
-removes the leading `000 ` sorting prefix used by rocksonic-rs. Files must use
-UTF-8. Entries may use absolute paths or paths relative to the M3U file;
+removes the leading `000 ` sorting prefix used by rocksonic-rs and cleans up
+obsolete prefixed copies already on the iPod. Files must use UTF-8. Entries may use absolute paths or paths relative to the M3U file;
 blank lines, comments, and extended-M3U metadata lines are ignored. Referenced
 tracks must be MP3s in one of the supplied library folders. Existing standard playlists with the same
 name are updated, while unrelated iPod playlists are preserved. Playlist writes
