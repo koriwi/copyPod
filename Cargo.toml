@@ -12,9 +12,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+libopod = { path = "/app" }
+tempfile = "3.14"
 lofty = "0.22"
 walkdir = "2.5"
-
-[build-dependencies]
-cc = "1.2"
-pkg-config = "0.3"

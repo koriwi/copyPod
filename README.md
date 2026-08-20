@@ -22,34 +22,38 @@ library match them.
 - Falls back to `cover`, `folder`, or `front` JPEG/PNG files next to the MP3
 - Adds missing artwork to existing tracks without copying the audio again
 - Checks for the FireWire GUID required by affected Nano and Classic models
-- Backs up `iTunesDB` before changing it
+- Uses the authoritative SQLite library on supported modern Nanos
 
-copyPod uses `libgpod`, the iPod database library also used by Rhythmbox and
-gtkpod.
+This migration branch uses the Rust `libopod` crate and has no libgpod, GLib,
+project C shim, or pkg-config integration. Dry-run planning works on the Nano
+7G profile. Real synchronization currently stops at a read-only preflight until
+libopod's staged multi-file writer and recovery support are complete.
 
 ## Requirements
 
 - Linux
 - Rust toolchain
-- `libgpod` development files
-- A mounted, non-Rockbox iPod supported by `libgpod`
+- A sibling checkout of the in-development `libopod` crate
+- A mounted, non-Rockbox iPod with a libopod read adapter
 - MP3 files; other audio formats are not supported yet
 
 ### Arch Linux
 
 ```bash
-sudo pacman -S --needed base-devel rust libgpod
+sudo pacman -S --needed base-devel rust
 ```
 
 ### Debian or Ubuntu
 
 ```bash
-sudo apt install build-essential cargo pkg-config libgpod-dev
+sudo apt install build-essential cargo
 ```
 
 ## Build
 
 ```bash
+# Place the libopod and copyPod checkouts next to each other:
+# parent/libopod and parent/copyPod
 git clone https://github.com/koriwi/copyPod.git
 cd copyPod
 cargo build --release
@@ -90,7 +94,7 @@ recursively; its directory layout is not copied to the iPod.
 ## Track matching
 
 Instead of hashing the audio on the iPod, copyPod compares information already
-stored in `iTunesDB` with the local MP3:
+stored in the iPod's authoritative library with the local MP3:
 
 - artist or album artist
 - album and title
@@ -111,8 +115,8 @@ For each MP3, copyPod looks for artwork in this order:
 3. `folder.jpg`, `folder.jpeg`, or `folder.png`
 4. `front.jpg`, `front.jpeg`, or `front.png`
 
-Names are matched case-insensitively. `libgpod` converts the image into the
-formats required by the connected iPod.
+Names are matched case-insensitively. Artwork writes will resume when libopod's
+profile-aware ArtworkDB/ithmb writer is enabled.
 
 ## FireWire GUID
 
@@ -127,7 +131,8 @@ missing or malformed. To initialize it, identify the iPod carefully:
 lsblk -o NAME,SIZE,MODEL,SERIAL,FSTYPE,MOUNTPOINTS
 ```
 
-Then run the `libgpod` helper with the verified **whole device** and mount point:
+Until libopod gains its own identity collection helper, use the existing helper
+with the verified **whole device** and mount point:
 
 ```bash
 sudo ipod-read-sysinfo-extended /dev/sdX /run/media/$USER/IPOD
@@ -138,13 +143,10 @@ to copyPod.
 
 ## Safety
 
-Before a real sync, copyPod stores the previous database at:
-
-```text
-iPod_Control/iTunes/iTunesDB.copyPod-backup
-```
-
-Always eject or unmount the iPod before unplugging it.
+This migration branch currently refuses every non-dry-run operation before
+changing media or database files. This is intentional: modern Nanos require a
+recoverable commit across the SQLite library, CBK signature, binary companion,
+and artwork files. Always eject or unmount the iPod before unplugging it.
 
 ## Current limitations
 

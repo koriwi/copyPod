@@ -1,11 +1,11 @@
-mod gpod;
+mod opod;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::picture::PictureType;
@@ -13,7 +13,7 @@ use lofty::prelude::Accessor;
 use lofty::probe::Probe;
 use walkdir::WalkDir;
 
-use crate::gpod::{Database, Metadata, Track};
+use crate::opod::{Database, Metadata, Track};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -106,9 +106,13 @@ fn run(cli: Cli) -> Result<()> {
 
     let existing = read_existing_tracks(&database)?;
     let (kept, deleted, copied) = make_plan(&sources, existing);
+    // Devices without writable cover formats (Nano 1G/2G) cannot store
+    // artwork at all; embedded source art is left out instead of failing.
+    let artwork_capable = database.supports_artwork();
     let artwork_updates: Vec<_> = kept
         .iter()
         .filter(|entry| !entry.existing.track.has_artwork && entry.source.artwork.is_some())
+        .filter(|_| artwork_capable)
         .collect();
 
     println!(
@@ -118,23 +122,18 @@ fn run(cli: Cli) -> Result<()> {
         copied.len(),
         artwork_updates.len()
     );
+    if !artwork_capable
+        && (kept.iter().any(|entry| entry.source.artwork.is_some())
+            || copied.iter().any(|source| source.artwork.is_some()))
+    {
+        println!("       (embedded artwork ignored: this device cannot store cover art)");
+    }
     print_plan(&deleted, &copied, &artwork_updates);
 
     if cli.dry_run {
         println!("Dry run: no files or database entries were changed.");
         return Ok(());
     }
-
-    let database_path = database.database_path()?;
-    let backup_path = backup_database(&database_path)?;
-    println!("Database backup: {}", backup_path.display());
-
-    // Verify that libgpod can sign and write this device's database before
-    // copyPod deletes any files.
-    database
-        .write()
-        .map_err(with_nano_hint)
-        .context("iPod preflight write failed; no music files have been changed")?;
 
     for entry in &deleted {
         println!("DELETE {}", describe_existing(&entry.track));
@@ -143,15 +142,16 @@ fn run(cli: Cli) -> Result<()> {
             .with_context(|| format!("failed to delete {}", entry.track.path.display()))?;
     }
 
-    // Commit deletion separately. If a subsequent copy fails, the database and
+    // Commit deletions separately. If a subsequent copy fails, the database and
     // filesystem still agree and rerunning copyPod can finish the mirror.
     if !deleted.is_empty() {
         database
             .write()
-            .map_err(with_nano_hint)
             .context("failed to save deletions to the iPod database")?;
     }
 
+    // Tracks kept without artwork but with artwork in the source are replaced
+    // by a fresh indexed entry carrying the artwork.
     for entry in &artwork_updates {
         let artwork = entry.source.artwork.as_ref().expect("filtered above");
         println!(
@@ -159,13 +159,17 @@ fn run(cli: Cli) -> Result<()> {
             entry.source.metadata.artist, entry.source.metadata.title, artwork.source
         );
         database
-            .set_artwork(entry.existing.track.handle, &artwork.data)
+            .remove_track(entry.existing.track.handle)
+            .with_context(|| {
+                format!("failed to replace {}", entry.source.path.display())
+            })?;
+        database
+            .add_track(&entry.source.path, &entry.source.metadata, Some(&artwork.data))
             .with_context(|| {
                 format!("failed to add artwork for {}", entry.source.path.display())
             })?;
     }
 
-    let mut newly_copied = Vec::new();
     for source in &copied {
         println!(
             "COPY   {} — {} ({})",
@@ -173,32 +177,24 @@ fn run(cli: Cli) -> Result<()> {
             source.metadata.title,
             source.path.display()
         );
-        let artwork = source
-            .artwork
-            .as_ref()
-            .map(|artwork| artwork.data.as_slice());
-        match database.add_track(&source.path, &source.metadata, artwork) {
-            Ok(path) => newly_copied.push(path),
-            Err(error) => {
-                remove_uncommitted_files(&newly_copied);
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to copy {}; rerun copyPod to retry",
-                        source.path.display()
-                    )
-                });
-            }
-        }
+        let artwork = if artwork_capable {
+            source
+                .artwork
+                .as_ref()
+                .map(|artwork| artwork.data.as_slice())
+        } else {
+            None
+        };
+        database
+            .add_track(&source.path, &source.metadata, artwork)
+            .with_context(|| {
+                format!("failed to copy {}; rerun copyPod to retry", source.path.display())
+            })?;
     }
 
-    if !copied.is_empty() || !artwork_updates.is_empty() {
-        if let Err(error) = database.write().map_err(with_nano_hint) {
-            remove_uncommitted_files(&newly_copied);
-            return Err(error).context(
-                "failed to save copied tracks or artwork; uncommitted copies were removed",
-            );
-        }
-    }
+    database
+        .write()
+        .context("failed to commit copied tracks or artwork to the iPod database")?;
 
     println!(
         "Done: kept {}, deleted {}, copied {}, added artwork to {}. Unmount/eject the iPod before unplugging it.",
@@ -215,34 +211,16 @@ fn check_firewire_guid(database: &Database, ipod: &Path) -> Result<()> {
         println!("FireWire GUID: not required");
         return Ok(());
     }
-
-    let Some(raw_guid) = database.firewire_guid() else {
+    if !database.has_firewire_guid() {
         bail!(
             "this iPod requires a FireWire GUID, but none was found in SysInfo or SysInfoExtended\n\
              Initialize it, then rerun copyPod:\n  sudo ipod-read-sysinfo-extended /dev/sdX {}",
             ipod.display()
         );
-    };
-    let guid = normalize_firewire_guid(&raw_guid).ok_or_else(|| {
-        anyhow!(
-            "this iPod requires a FireWire GUID, but `{raw_guid}` is invalid\n\
-             Regenerate it, then rerun copyPod:\n  sudo ipod-read-sysinfo-extended /dev/sdX {}",
-            ipod.display()
-        )
-    })?;
+    }
 
-    println!("FireWire GUID: required, present ({guid})");
+    println!("FireWire GUID: required and present (value redacted)");
     Ok(())
-}
-
-fn normalize_firewire_guid(value: &str) -> Option<String> {
-    let value = value.trim();
-    let value = value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-        .unwrap_or(value);
-    (value.len() == 16 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .then(|| value.to_ascii_uppercase())
 }
 
 fn validate_libraries(libraries: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -313,7 +291,7 @@ fn scan_sources(libraries: &[PathBuf]) -> Result<(Vec<SourceTrack>, usize)> {
 
 fn read_existing_tracks(database: &Database) -> Result<Vec<ExistingTrack>> {
     let total = database.track_count();
-    println!("Checking {total} existing iPod track(s) from iTunesDB…");
+    println!("Checking {total} existing iPod track(s) from the authoritative library…");
     Ok(database
         .tracks()?
         .into_iter()
@@ -613,38 +591,6 @@ fn is_unsupported_audio(path: &Path) -> bool {
         })
 }
 
-fn backup_database(database_path: &Path) -> Result<PathBuf> {
-    let filename = database_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow!("invalid iTunesDB path: {}", database_path.display()))?;
-    let backup = database_path.with_file_name(format!("{filename}.copyPod-backup"));
-    fs::copy(database_path, &backup).with_context(|| {
-        format!(
-            "could not back up {} to {}",
-            database_path.display(),
-            backup.display()
-        )
-    })?;
-    Ok(backup)
-}
-
-fn remove_uncommitted_files(paths: &[PathBuf]) {
-    for path in paths {
-        if let Err(error) = fs::remove_file(path) {
-            eprintln!(
-                "warning: could not remove uncommitted copy {}: {error}",
-                path.display()
-            );
-        }
-    }
-}
-
-fn with_nano_hint(error: anyhow::Error) -> anyhow::Error {
-    anyhow!(
-        "{error:#}\nFor a Nano 3G, make sure iPod_Control/Device/SysInfoExtended contains its FireWire GUID. The one-time setup is:\n  sudo ipod-read-sysinfo-extended /dev/sdX /path/to/mounted/ipod"
-    )
-}
 
 #[cfg(test)]
 mod tests {
@@ -662,20 +608,6 @@ mod tests {
         assert!(is_unsupported_audio(Path::new("song.flac")));
         assert!(is_unsupported_audio(Path::new("song.M4A")));
         assert!(!is_unsupported_audio(Path::new("cover.jpg")));
-    }
-
-    #[test]
-    fn validates_and_normalizes_firewire_guids() {
-        assert_eq!(
-            normalize_firewire_guid("0x000a27001aae9513"),
-            Some("000A27001AAE9513".to_owned())
-        );
-        assert_eq!(
-            normalize_firewire_guid("000A27001AAE9513"),
-            Some("000A27001AAE9513".to_owned())
-        );
-        assert_eq!(normalize_firewire_guid("not-a-guid"), None);
-        assert_eq!(normalize_firewire_guid("000A27001AAE951"), None);
     }
 
     #[test]
