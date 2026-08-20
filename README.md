@@ -104,7 +104,7 @@ currently work on classic binary-iTunesDB models supported by libopod.
 Instead of hashing the audio on the iPod, copyPod compares information already
 stored in the iPod's authoritative library with the local MP3:
 
-- artist or album artist
+- track artist (falling back to album artist when track artist is missing)
 - album and title
 - exact file size
 - duration, rounded to a second

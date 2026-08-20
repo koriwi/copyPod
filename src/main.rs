@@ -806,10 +806,15 @@ fn metadata_key(
     track_number: u32,
     disc_number: u32,
 ) -> TrackKey {
-    let effective_artist = if album_artist.trim().is_empty() {
-        artist
-    } else {
+    // The track artist identifies the recording; album artist is grouping
+    // metadata and can legitimately differ on compilations. Some classic iPod
+    // databases also omit album artist when libopod rewrites a track, so using
+    // it as the primary identity causes a perpetual delete/copy cycle. Only
+    // use album artist as a fallback when the track artist is absent.
+    let effective_artist = if artist.trim().is_empty() {
         album_artist
+    } else {
+        artist
     };
     TrackKey {
         artist: normalize_tag(effective_artist),
@@ -889,7 +894,7 @@ mod tests {
     #[test]
     fn track_keys_normalize_tags_but_require_the_same_size() {
         let first = metadata_key(
-            "",
+            "Compilation Artist",
             "  Some   Artist ",
             "ALBUM",
             "Song",
@@ -903,6 +908,14 @@ mod tests {
 
         assert_eq!(first, same);
         assert_ne!(first, different_size);
+    }
+
+    #[test]
+    fn track_key_falls_back_to_album_artist_when_artist_is_missing() {
+        let album_artist = metadata_key("Artist", "", "Album", "Song", 1, 1, 0, 0);
+        let track_artist = metadata_key("", "Artist", "Album", "Song", 1, 1, 0, 0);
+
+        assert_eq!(album_artist, track_artist);
     }
 
     #[test]
