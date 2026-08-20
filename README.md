@@ -16,6 +16,7 @@ library match them.
 ## Features
 
 - Recursively syncs any number of folders
+- Creates and updates iPod playlists from `.m3u` and `.m3u8` files
 - Skips existing tracks without reading and hashing every file on the iPod
 - Matches tracks using tags, exact file size, duration, and track/disc numbers
 - Reads cover art embedded in MP3s
@@ -24,10 +25,9 @@ library match them.
 - Checks for the FireWire GUID required by affected Nano and Classic models
 - Uses the authoritative SQLite library on supported modern Nanos
 
-This migration branch uses the Rust `libopod` crate and has no libgpod, GLib,
-project C shim, or pkg-config integration. Dry-run planning works on the Nano
-7G profile. Real synchronization currently stops at a read-only preflight until
-libopod's staged multi-file writer and recovery support are complete.
+copyPod uses the Rust `libopod` crate and has no libgpod, GLib, project C shim,
+or pkg-config integration. libopod stages and installs database changes as a
+recoverable transaction on supported iPod profiles.
 
 ## Requirements
 
@@ -89,6 +89,14 @@ copyPod \
 `-l/--library` may be supplied more than once. Each folder is scanned
 recursively; its directory layout is not copied to the iPod.
 
+M3U and M3U8 files within those folders become standard iPod playlists. The
+playlist filename (without its extension) becomes the playlist name. Files must
+use UTF-8. Entries may use absolute paths or paths relative to the M3U file;
+blank lines, comments, and extended-M3U metadata lines are ignored. Referenced tracks must be MP3s in
+one of the supplied library folders. Existing standard playlists with the same
+name are updated, while unrelated iPod playlists are preserved. Playlist writes
+currently work on classic binary-iTunesDB models supported by libopod.
+
 `-i/--ipod` must be the mounted filesystem path, **not** `/dev/sdX`.
 
 ## Track matching
@@ -115,8 +123,8 @@ For each MP3, copyPod looks for artwork in this order:
 3. `folder.jpg`, `folder.jpeg`, or `folder.png`
 4. `front.jpg`, `front.jpeg`, or `front.png`
 
-Names are matched case-insensitively. Artwork writes will resume when libopod's
-profile-aware ArtworkDB/ithmb writer is enabled.
+Names are matched case-insensitively. Artwork is written only when the detected
+device profile supports it.
 
 ## FireWire GUID
 
@@ -143,14 +151,13 @@ to copyPod.
 
 ## Safety
 
-This migration branch currently refuses every non-dry-run operation before
-changing media or database files. This is intentional: modern Nanos require a
-recoverable commit across the SQLite library, CBK signature, binary companion,
-and artwork files. Always eject or unmount the iPod before unplugging it.
+libopod stages database and media changes and installs them as a recoverable
+transaction. Even so, keep a backup and run with `--dry-run` before the first
+sync. Always eject or unmount the iPod before unplugging it.
 
 ## Current limitations
 
 - MP3 only; no transcoding
-- No playlist creation
+- Playlist writes require a classic binary-iTunesDB model supported by libopod
 - No video or podcast handling
 - Full-mirror synchronization only

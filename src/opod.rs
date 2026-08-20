@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use libopod::{ChecksumKind, Device, MediaDeletionPolicy, PersistentId, TrackToAdd};
+use libopod::{BackendKind, ChecksumKind, Device, MediaDeletionPolicy, PersistentId, TrackToAdd};
 
 #[derive(Clone, Debug)]
 pub struct Metadata {
@@ -25,8 +25,11 @@ pub struct Metadata {
     pub disc_total: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TrackHandle(PersistentId);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PlaylistHandle(PersistentId);
 
 #[derive(Debug)]
 pub struct Track {
@@ -43,10 +46,28 @@ pub struct Track {
     pub has_artwork: bool,
 }
 
+#[derive(Debug)]
+pub struct Playlist {
+    pub handle: PlaylistHandle,
+    pub name: String,
+    pub tracks: Vec<TrackHandle>,
+    pub is_hidden: bool,
+    pub is_smart: bool,
+}
+
 /// One queued library change, committed by [`Database::write`].
 enum PendingChange {
     Remove(PersistentId),
     Add(Box<PendingAdd>),
+    CreatePlaylist {
+        name: String,
+        tracks: Vec<PersistentId>,
+    },
+    UpdatePlaylist {
+        id: PersistentId,
+        name: String,
+        tracks: Vec<PersistentId>,
+    },
 }
 
 struct PendingAdd {
@@ -100,6 +121,14 @@ impl Database {
             .is_some_and(|profile| profile.capabilities().supports_artwork())
     }
 
+    /// Playlist mutations are currently implemented by libopod for classic
+    /// binary iTunesDB devices.
+    pub fn supports_playlists(&self) -> bool {
+        self.device
+            .profile()
+            .is_some_and(|profile| profile.capabilities().backend == BackendKind::Binary)
+    }
+
     pub fn has_firewire_guid(&self) -> bool {
         self.device.evidence().has_firewire_guid()
     }
@@ -136,11 +165,37 @@ impl Database {
             .collect()
     }
 
+    pub fn playlists(&self) -> Result<Vec<Playlist>> {
+        let library = self
+            .device
+            .library()
+            .context("libopod has no readable library for this device")?;
+        Ok(library
+            .playlists()
+            .iter()
+            .map(|playlist| Playlist {
+                handle: PlaylistHandle(playlist.id),
+                name: playlist.name.clone(),
+                tracks: playlist
+                    .track_ids()
+                    .iter()
+                    .copied()
+                    .map(TrackHandle)
+                    .collect(),
+                is_hidden: playlist.is_hidden,
+                is_smart: playlist.is_smart,
+            })
+            .collect())
+    }
+
     /// Queues a track removal. The media file is deleted as part of the
     /// commit (libopod backs it up and restores it on rollback).
     pub fn remove_track(&mut self, track: TrackHandle) -> Result<()> {
         let present = self.device.library().is_some_and(|library| {
-            library.tracks().iter().any(|existing| existing.id == track.0)
+            library
+                .tracks()
+                .iter()
+                .any(|existing| existing.id == track.0)
         });
         if !present {
             bail!("track is not present in the opened library");
@@ -165,6 +220,40 @@ impl Database {
             metadata: metadata.clone(),
             artwork: artwork.map(<[u8]>::to_vec),
         })));
+        Ok(())
+    }
+
+    /// Queues a standard playlist creation.
+    pub fn create_playlist(&mut self, name: &str, tracks: &[TrackHandle]) -> Result<()> {
+        validate_playlist_name(name)?;
+        self.pending.push(PendingChange::CreatePlaylist {
+            name: name.to_owned(),
+            tracks: tracks.iter().map(|track| track.0).collect(),
+        });
+        Ok(())
+    }
+
+    /// Queues a standard playlist name and membership update.
+    pub fn update_playlist(
+        &mut self,
+        playlist: PlaylistHandle,
+        name: &str,
+        tracks: &[TrackHandle],
+    ) -> Result<()> {
+        validate_playlist_name(name)?;
+        let editable = self.device.library().is_some_and(|library| {
+            library.playlists().iter().any(|existing| {
+                existing.id == playlist.0 && !existing.is_hidden && !existing.is_smart
+            })
+        });
+        if !editable {
+            bail!("playlist is absent, hidden, or smart and cannot be updated");
+        }
+        self.pending.push(PendingChange::UpdatePlaylist {
+            id: playlist.0,
+            name: name.to_owned(),
+            tracks: tracks.iter().map(|track| track.0).collect(),
+        });
         Ok(())
     }
 
@@ -220,8 +309,17 @@ impl Database {
                         reuse_album_art: false,
                         artwork_source,
                     };
-                    edit.add_track(addition)
-                        .context("queue track addition")?;
+                    edit.add_track(addition).context("queue track addition")?;
+                }
+                PendingChange::CreatePlaylist { name, tracks } => {
+                    edit.create_playlist(name, &tracks)
+                        .context("queue playlist creation")?;
+                }
+                PendingChange::UpdatePlaylist { id, name, tracks } => {
+                    edit.rename_playlist(id, name)
+                        .context("queue playlist rename")?;
+                    edit.set_playlist_tracks(id, &tracks)
+                        .context("queue playlist membership update")?;
                 }
             }
         }
@@ -234,10 +332,16 @@ impl Database {
             .context("install staged changes; rerun copyPod to retry")?;
         // The commit rewrote the device databases; refresh the cached device
         // (generation fingerprint, library) for the next write cycle.
-        self.device =
-            Device::open(&self.mountpoint).context("reopen the iPod after the commit")?;
+        self.device = Device::open(&self.mountpoint).context("reopen the iPod after the commit")?;
         Ok(())
     }
+}
+
+fn validate_playlist_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        bail!("playlist name must not be empty");
+    }
+    Ok(())
 }
 
 fn non_empty(value: &str) -> Option<String> {

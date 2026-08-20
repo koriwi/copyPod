@@ -13,7 +13,7 @@ use lofty::prelude::Accessor;
 use lofty::probe::Probe;
 use walkdir::WalkDir;
 
-use crate::opod::{Database, Metadata, Track};
+use crate::opod::{Database, Metadata, Playlist, PlaylistHandle, Track, TrackHandle};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -61,6 +61,13 @@ struct SourceTrack {
 }
 
 #[derive(Debug)]
+struct SourcePlaylist {
+    name: String,
+    path: PathBuf,
+    tracks: Vec<TrackKey>,
+}
+
+#[derive(Debug)]
 struct ExistingTrack {
     track: Track,
 }
@@ -69,6 +76,19 @@ struct ExistingTrack {
 struct KeptTrack<'a> {
     existing: ExistingTrack,
     source: &'a SourceTrack,
+}
+
+#[derive(Debug)]
+struct PlaylistUpdate<'a> {
+    source: &'a SourcePlaylist,
+    handle: PlaylistHandle,
+}
+
+#[derive(Debug, Default)]
+struct PlaylistPlan<'a> {
+    kept: Vec<&'a SourcePlaylist>,
+    created: Vec<&'a SourcePlaylist>,
+    updated: Vec<PlaylistUpdate<'a>>,
 }
 
 fn main() {
@@ -83,15 +103,16 @@ fn run(cli: Cli) -> Result<()> {
     let ipod = validate_ipod(&cli.ipod)?;
 
     println!("Scanning {} source folder(s)…", libraries.len());
-    let (sources, duplicate_sources) = scan_sources(&libraries)?;
+    let (sources, source_playlists, duplicate_sources) = scan_sources(&libraries)?;
     println!(
-        "Found {} unique MP3 file(s){}.",
+        "Found {} unique MP3 file(s){} and {} M3U playlist(s).",
         sources.len(),
         if duplicate_sources == 0 {
             String::new()
         } else {
             format!(" ({duplicate_sources} duplicate(s) ignored)")
-        }
+        },
+        source_playlists.len()
     );
 
     println!("Reading iPod database at {}…", ipod.display());
@@ -103,8 +124,27 @@ fn run(cli: Cli) -> Result<()> {
     })?;
     println!("Device: {}", database.description());
     check_firewire_guid(&database, &ipod)?;
+    if !source_playlists.is_empty() && !database.supports_playlists() {
+        bail!(
+            "{} M3U playlist(s) were found, but libopod does not support playlist writes for this iPod profile",
+            source_playlists.len()
+        );
+    }
 
     let existing = read_existing_tracks(&database)?;
+    let playlist_plan = if source_playlists.is_empty() {
+        PlaylistPlan::default()
+    } else {
+        let existing_track_keys: HashMap<_, _> = existing
+            .iter()
+            .map(|entry| (entry.track.handle, existing_key(&entry.track)))
+            .collect();
+        make_playlist_plan(
+            &source_playlists,
+            database.playlists()?,
+            &existing_track_keys,
+        )
+    };
     let (kept, deleted, copied) = make_plan(&sources, existing);
     // Devices without writable cover formats (Nano 1G/2G) cannot store
     // artwork at all; embedded source art is left out instead of failing.
@@ -116,11 +156,14 @@ fn run(cli: Cli) -> Result<()> {
         .collect();
 
     println!(
-        "Plan: keep {}, delete {}, copy {}, add artwork to {}.",
+        "Plan: keep {}, delete {}, copy {}, add artwork to {}; keep {} playlist(s), create {}, update {}.",
         kept.len(),
         deleted.len(),
         copied.len(),
-        artwork_updates.len()
+        artwork_updates.len(),
+        playlist_plan.kept.len(),
+        playlist_plan.created.len(),
+        playlist_plan.updated.len()
     );
     if !artwork_capable
         && (kept.iter().any(|entry| entry.source.artwork.is_some())
@@ -129,6 +172,7 @@ fn run(cli: Cli) -> Result<()> {
         println!("       (embedded artwork ignored: this device cannot store cover art)");
     }
     print_plan(&deleted, &copied, &artwork_updates);
+    print_playlist_plan(&playlist_plan);
 
     if cli.dry_run {
         println!("Dry run: no files or database entries were changed.");
@@ -160,11 +204,13 @@ fn run(cli: Cli) -> Result<()> {
         );
         database
             .remove_track(entry.existing.track.handle)
-            .with_context(|| {
-                format!("failed to replace {}", entry.source.path.display())
-            })?;
+            .with_context(|| format!("failed to replace {}", entry.source.path.display()))?;
         database
-            .add_track(&entry.source.path, &entry.source.metadata, Some(&artwork.data))
+            .add_track(
+                &entry.source.path,
+                &entry.source.metadata,
+                Some(&artwork.data),
+            )
             .with_context(|| {
                 format!("failed to add artwork for {}", entry.source.path.display())
             })?;
@@ -188,7 +234,10 @@ fn run(cli: Cli) -> Result<()> {
         database
             .add_track(&source.path, &source.metadata, artwork)
             .with_context(|| {
-                format!("failed to copy {}; rerun copyPod to retry", source.path.display())
+                format!(
+                    "failed to copy {}; rerun copyPod to retry",
+                    source.path.display()
+                )
             })?;
     }
 
@@ -196,12 +245,37 @@ fn run(cli: Cli) -> Result<()> {
         .write()
         .context("failed to commit copied tracks or artwork to the iPod database")?;
 
+    // Additions and artwork replacements receive their persistent IDs during
+    // the track commit, so rebuild the playlist plan against the refreshed
+    // library before queueing playlist mutations.
+    let playlist_plan = if source_playlists.is_empty() {
+        PlaylistPlan::default()
+    } else {
+        let synced_tracks = database.tracks()?;
+        let synced_track_keys: HashMap<_, _> = synced_tracks
+            .iter()
+            .map(|track| (track.handle, existing_key(track)))
+            .collect();
+        let plan = make_playlist_plan(&source_playlists, database.playlists()?, &synced_track_keys);
+        let handles_by_key: HashMap<_, _> = synced_tracks
+            .iter()
+            .map(|track| (existing_key(track), track.handle))
+            .collect();
+        apply_playlist_plan(&mut database, &plan, &handles_by_key)?;
+        database
+            .write()
+            .context("failed to commit M3U playlists to the iPod database")?;
+        plan
+    };
+
     println!(
-        "Done: kept {}, deleted {}, copied {}, added artwork to {}. Unmount/eject the iPod before unplugging it.",
+        "Done: kept {}, deleted {}, copied {}, added artwork to {}; created {} playlist(s), updated {}. Unmount/eject the iPod before unplugging it.",
         kept.len(),
         deleted.len(),
         copied.len(),
-        artwork_updates.len()
+        artwork_updates.len(),
+        playlist_plan.created.len(),
+        playlist_plan.updated.len()
     );
     Ok(())
 }
@@ -254,8 +328,9 @@ fn validate_ipod(ipod: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-fn scan_sources(libraries: &[PathBuf]) -> Result<(Vec<SourceTrack>, usize)> {
-    let mut paths = Vec::new();
+fn scan_sources(libraries: &[PathBuf]) -> Result<(Vec<SourceTrack>, Vec<SourcePlaylist>, usize)> {
+    let mut track_paths = Vec::new();
+    let mut playlist_paths = Vec::new();
     for library in libraries {
         for entry in WalkDir::new(library).follow_links(false) {
             let entry = entry.with_context(|| format!("could not scan {}", library.display()))?;
@@ -264,7 +339,9 @@ fn scan_sources(libraries: &[PathBuf]) -> Result<(Vec<SourceTrack>, usize)> {
             }
             let path = entry.into_path();
             if is_mp3(&path) {
-                paths.push(path);
+                track_paths.push(path);
+            } else if is_m3u(&path) {
+                playlist_paths.push(path);
             } else if is_unsupported_audio(&path) {
                 eprintln!(
                     "warning: unsupported audio file ignored: {}",
@@ -273,20 +350,98 @@ fn scan_sources(libraries: &[PathBuf]) -> Result<(Vec<SourceTrack>, usize)> {
             }
         }
     }
-    paths.sort();
+    track_paths.sort();
+    playlist_paths.sort();
 
     let mut seen = HashSet::new();
     let mut tracks = Vec::new();
+    let mut keys_by_path = HashMap::new();
     let mut duplicates = 0;
-    for path in paths {
+    for path in track_paths {
         let track = read_source_track(path)?;
-        if !seen.insert(source_key(&track)) {
+        let key = source_key(&track);
+        keys_by_path.insert(track.path.clone(), key.clone());
+        if !seen.insert(key) {
             duplicates += 1;
             continue;
         }
         tracks.push(track);
     }
-    Ok((tracks, duplicates))
+    let playlists = read_source_playlists(&playlist_paths, &keys_by_path)?;
+    Ok((tracks, playlists, duplicates))
+}
+
+fn read_source_playlists(
+    paths: &[PathBuf],
+    keys_by_path: &HashMap<PathBuf, TrackKey>,
+) -> Result<Vec<SourcePlaylist>> {
+    let mut seen_names = HashMap::<String, PathBuf>::new();
+    let mut playlists = Vec::new();
+    for path in paths {
+        let name = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.trim().is_empty())
+            .with_context(|| format!("playlist has no valid UTF-8 name: {}", path.display()))?
+            .to_owned();
+        if name.encode_utf16().count() > 255 {
+            bail!(
+                "playlist name exceeds 255 UTF-16 code units: {}",
+                path.display()
+            );
+        }
+        let normalized_name = normalize_playlist_name(&name);
+        if let Some(previous) = seen_names.insert(normalized_name, path.clone()) {
+            bail!(
+                "M3U playlists must have unique names (case-insensitive): {} and {}",
+                previous.display(),
+                path.display()
+            );
+        }
+
+        let bytes = fs::read(path)
+            .with_context(|| format!("could not read M3U playlist: {}", path.display()))?;
+        let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+        let contents = std::str::from_utf8(bytes)
+            .with_context(|| format!("M3U playlist is not UTF-8: {}", path.display()))?;
+        let directory = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut tracks = Vec::new();
+        for (line_index, line) in contents.lines().enumerate() {
+            let entry = line.trim();
+            if entry.is_empty() || entry.starts_with('#') {
+                continue;
+            }
+            let referenced = Path::new(entry);
+            let referenced = if referenced.is_absolute() {
+                referenced.to_path_buf()
+            } else {
+                directory.join(referenced)
+            };
+            let referenced = referenced.canonicalize().with_context(|| {
+                format!(
+                    "{}:{} references a missing track: {}",
+                    path.display(),
+                    line_index + 1,
+                    entry
+                )
+            })?;
+            let key = keys_by_path.get(&referenced).with_context(|| {
+                format!(
+                    "{}:{} references a track outside the supplied MP3 libraries: {}",
+                    path.display(),
+                    line_index + 1,
+                    referenced.display()
+                )
+            })?;
+            tracks.push(key.clone());
+        }
+        playlists.push(SourcePlaylist {
+            name,
+            path: path.clone(),
+            tracks,
+        });
+    }
+    Ok(playlists)
 }
 
 fn read_existing_tracks(database: &Database) -> Result<Vec<ExistingTrack>> {
@@ -332,6 +487,96 @@ fn make_plan<'a>(
     (kept, deleted, copied)
 }
 
+fn make_playlist_plan<'a>(
+    sources: &'a [SourcePlaylist],
+    existing: Vec<Playlist>,
+    track_keys: &HashMap<TrackHandle, TrackKey>,
+) -> PlaylistPlan<'a> {
+    let mut kept = Vec::new();
+    let mut created = Vec::new();
+    let mut updated = Vec::new();
+    let mut matched = HashSet::new();
+
+    for source in sources {
+        let existing_playlist = existing.iter().find(|playlist| {
+            !playlist.is_hidden
+                && !playlist.is_smart
+                && !matched.contains(&playlist.handle)
+                && normalize_playlist_name(&playlist.name) == normalize_playlist_name(&source.name)
+        });
+        let Some(existing_playlist) = existing_playlist else {
+            created.push(source);
+            continue;
+        };
+        matched.insert(existing_playlist.handle);
+        let existing_keys: Option<Vec<_>> = existing_playlist
+            .tracks
+            .iter()
+            .map(|handle| track_keys.get(handle).cloned())
+            .collect();
+        if existing_playlist.name == source.name
+            && existing_keys.as_deref() == Some(source.tracks.as_slice())
+        {
+            kept.push(source);
+        } else {
+            updated.push(PlaylistUpdate {
+                source,
+                handle: existing_playlist.handle,
+            });
+        }
+    }
+
+    PlaylistPlan {
+        kept,
+        created,
+        updated,
+    }
+}
+
+fn apply_playlist_plan(
+    database: &mut Database,
+    plan: &PlaylistPlan<'_>,
+    handles_by_key: &HashMap<TrackKey, TrackHandle>,
+) -> Result<()> {
+    for source in &plan.created {
+        let tracks = resolve_playlist_handles(source, handles_by_key)?;
+        println!("PLAYLIST + {} ({})", source.name, source.path.display());
+        database
+            .create_playlist(&source.name, &tracks)
+            .with_context(|| format!("failed to create playlist {}", source.name))?;
+    }
+    for update in &plan.updated {
+        let tracks = resolve_playlist_handles(update.source, handles_by_key)?;
+        println!(
+            "PLAYLIST ~ {} ({})",
+            update.source.name,
+            update.source.path.display()
+        );
+        database
+            .update_playlist(update.handle, &update.source.name, &tracks)
+            .with_context(|| format!("failed to update playlist {}", update.source.name))?;
+    }
+    Ok(())
+}
+
+fn resolve_playlist_handles(
+    source: &SourcePlaylist,
+    handles_by_key: &HashMap<TrackKey, TrackHandle>,
+) -> Result<Vec<TrackHandle>> {
+    source
+        .tracks
+        .iter()
+        .map(|key| {
+            handles_by_key.get(key).copied().with_context(|| {
+                format!(
+                    "playlist {} contains a track that was not synchronized",
+                    source.path.display()
+                )
+            })
+        })
+        .collect()
+}
+
 fn print_plan(
     deleted: &[ExistingTrack],
     copied: &[&SourceTrack],
@@ -353,6 +598,19 @@ fn print_plan(
         println!(
             "~ artwork: {} — {} ({})",
             entry.source.metadata.artist, entry.source.metadata.title, artwork.source
+        );
+    }
+}
+
+fn print_playlist_plan(plan: &PlaylistPlan<'_>) {
+    for source in &plan.created {
+        println!("+ playlist: {} ({})", source.name, source.path.display());
+    }
+    for update in &plan.updated {
+        println!(
+            "~ playlist: {} ({})",
+            update.source.name,
+            update.source.path.display()
         );
     }
 }
@@ -572,10 +830,22 @@ fn normalize_tag(value: &str) -> String {
         .to_lowercase()
 }
 
+fn normalize_playlist_name(value: &str) -> String {
+    value.trim().to_lowercase()
+}
+
 fn is_mp3(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("mp3"))
+}
+
+fn is_m3u(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("m3u") || extension.eq_ignore_ascii_case("m3u8")
+        })
 }
 
 fn is_unsupported_audio(path: &Path) -> bool {
@@ -591,7 +861,6 @@ fn is_unsupported_audio(path: &Path) -> bool {
         })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,6 +870,13 @@ mod tests {
         assert!(is_mp3(Path::new("song.mp3")));
         assert!(is_mp3(Path::new("song.MP3")));
         assert!(!is_mp3(Path::new("song.flac")));
+    }
+
+    #[test]
+    fn recognizes_m3u_case_insensitively() {
+        assert!(is_m3u(Path::new("mix.m3u")));
+        assert!(is_m3u(Path::new("mix.M3U8")));
+        assert!(!is_m3u(Path::new("mix.txt")));
     }
 
     #[test]
@@ -627,6 +903,40 @@ mod tests {
 
         assert_eq!(first, same);
         assert_ne!(first, different_size);
+    }
+
+    #[test]
+    fn reads_relative_extended_m3u_entries_in_order() {
+        let directory =
+            std::env::temp_dir().join(format!("copypod-m3u-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(directory.join("music")).unwrap();
+        let first = directory.join("music/one.mp3");
+        let second = directory.join("music/two.mp3");
+        fs::write(&first, []).unwrap();
+        fs::write(&second, []).unwrap();
+        let playlist_path = directory.join("Road Trip.m3u8");
+        fs::write(
+            &playlist_path,
+            b"\xef\xbb\xbf#EXTM3U\n#EXTINF:1,One\nmusic/one.mp3\n\n music/two.mp3 \nmusic/one.mp3\n",
+        )
+        .unwrap();
+
+        let first_key = metadata_key("", "a", "b", "one", 1, 1, 0, 0);
+        let second_key = metadata_key("", "a", "b", "two", 1, 1, 0, 0);
+        let keys = HashMap::from([
+            (first.canonicalize().unwrap(), first_key.clone()),
+            (second.canonicalize().unwrap(), second_key.clone()),
+        ]);
+        let playlists = read_source_playlists(&[playlist_path], &keys).unwrap();
+
+        assert_eq!(playlists.len(), 1);
+        assert_eq!(playlists[0].name, "Road Trip");
+        assert_eq!(
+            playlists[0].tracks,
+            vec![first_key.clone(), second_key, first_key]
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

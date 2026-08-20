@@ -434,8 +434,6 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 [[package]]
 name = "libopod-rs"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "511ddd896ccd856f06591a280ffdabcf9a80c226c2fa9fea28f5a68b8d547297"
 dependencies = [
  "flate2",
  "fs2",
