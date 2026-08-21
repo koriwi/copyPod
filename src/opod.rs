@@ -136,12 +136,11 @@ impl Database {
             .is_some_and(|profile| profile.capabilities().supports_artwork())
     }
 
-    /// Playlist mutations are currently implemented by libopod for classic
-    /// binary iTunesDB devices.
+    /// Whether libopod supports playlist mutations for this device profile.
     pub fn supports_playlists(&self) -> bool {
-        self.device
-            .profile()
-            .is_some_and(|profile| profile.capabilities().backend == BackendKind::Binary)
+        self.device.profile().is_some_and(|profile| {
+            profile_supports_playlists(profile.key(), profile.capabilities().backend)
+        })
     }
 
     pub fn has_firewire_guid(&self) -> bool {
@@ -370,6 +369,10 @@ impl Database {
     }
 }
 
+fn profile_supports_playlists(profile_key: &str, backend: BackendKind) -> bool {
+    backend == BackendKind::Binary || profile_key == "nano-7g"
+}
+
 fn validate_playlist_name(name: &str) -> Result<()> {
     if name.trim().is_empty() {
         bail!("playlist name must not be empty");
@@ -382,5 +385,24 @@ fn non_empty(value: &str) -> Option<String> {
         None
     } else {
         Some(value.trim().to_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::profile_supports_playlists;
+    use libopod::BackendKind;
+
+    #[test]
+    fn enables_qualified_playlist_backends() {
+        assert!(profile_supports_playlists("nano-3g", BackendKind::Binary));
+        assert!(profile_supports_playlists(
+            "nano-7g",
+            BackendKind::SqliteWithBinaryCompanion
+        ));
+        assert!(!profile_supports_playlists(
+            "future-sqlite-device",
+            BackendKind::SqliteWithBinaryCompanion
+        ));
     }
 }

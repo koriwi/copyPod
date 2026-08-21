@@ -96,7 +96,7 @@ obsolete prefixed copies already on the iPod. Files must use UTF-8. Entries may 
 blank lines, comments, and extended-M3U metadata lines are ignored. Referenced
 tracks must be MP3s in one of the supplied library folders. Existing standard playlists with the same
 name are updated, while unrelated iPod playlists are preserved. Playlist writes
-currently work on classic binary-iTunesDB models supported by libopod.
+work on the Nano 7G and classic binary-iTunesDB models supported by libopod.
 
 `-i/--ipod` must be the mounted filesystem path, **not** `/dev/sdX`.
 
@@ -159,6 +159,6 @@ sync. Always eject or unmount the iPod before unplugging it.
 ## Current limitations
 
 - MP3 only; no transcoding
-- Playlist writes require a classic binary-iTunesDB model supported by libopod
+- Playlist writes require a Nano 7G or classic binary-iTunesDB model supported by libopod
 - No video or podcast handling
 - Full-mirror synchronization only
