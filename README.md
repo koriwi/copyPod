@@ -161,8 +161,17 @@ to copyPod.
 ## Safety
 
 libopod stages database and media changes and installs them as a recoverable
-transaction. Even so, keep a backup and run with `--dry-run` before the first
-sync. Always eject or unmount the iPod before unplugging it.
+transaction. If copyPod finds an interrupted transaction, it asks before
+recovery; a dry run never performs recovery. Do not rename or manually modify
+`.libopod-transaction-v1`.
+
+Before planning a mirror, copyPod audits database media references. A missing
+file is removed from the database and recopied when it is still present in the
+source library; obsolete dangling references are removed without a recopy.
+These repairs appear explicitly in normal and dry-run output.
+
+Even so, keep a backup and run with `--dry-run` before the first sync. Always
+eject or unmount the iPod before unplugging it.
 
 ## Current limitations
 

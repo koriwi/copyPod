@@ -46,7 +46,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: koriwi/libopod
-          ref: ddce7feb911635f2959f2b726e64deb67513106b
+          ref: 3781206a94d9912f9cec5626880aaf7dc7abf191
           path: libopod
 
       - name: Install Rust

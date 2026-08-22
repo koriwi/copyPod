@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{bail, Context, Result};
 use libopod::{BackendKind, ChecksumKind, Device, MediaDeletionPolicy, PersistentId, TrackToAdd};
@@ -49,6 +52,7 @@ impl PlaylistHandle {
 pub struct Track {
     pub handle: TrackHandle,
     pub path: PathBuf,
+    pub media_missing: bool,
     pub title: String,
     pub album: String,
     pub artist: String,
@@ -112,6 +116,12 @@ impl Database {
         })
     }
 
+    /// Recovers an interrupted libopod transaction at `mountpoint`.
+    pub fn recover_interrupted_transaction(mountpoint: &Path) -> Result<bool> {
+        libopod::recover_interrupted_transaction(mountpoint)
+            .context("libopod could not recover the interrupted transaction")
+    }
+
     pub fn description(&self) -> String {
         self.device.profile().map_or_else(
             || "unknown iPod".to_owned(),
@@ -154,6 +164,12 @@ impl Database {
     }
 
     pub fn tracks(&self) -> Result<Vec<Track>> {
+        let missing: HashSet<_> = self
+            .device
+            .missing_media_track_ids()
+            .context("audit iPod media references")?
+            .into_iter()
+            .collect();
         let library = self
             .device
             .library()
@@ -162,9 +178,16 @@ impl Database {
             .tracks()
             .iter()
             .map(|track| {
+                let media_missing = missing.contains(&track.id);
+                let path = if media_missing {
+                    self.device.mount().as_path().join(track.location.as_str())
+                } else {
+                    self.device.track_path(track)?
+                };
                 Ok(Track {
                     handle: TrackHandle(track.id),
-                    path: self.device.track_path(track)?,
+                    path,
+                    media_missing,
                     title: track.title.clone(),
                     album: track.album.clone(),
                     artist: track.artist.clone(),

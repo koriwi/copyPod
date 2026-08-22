@@ -2,6 +2,7 @@ mod opod;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -123,12 +124,7 @@ fn run(cli: Cli) -> Result<()> {
     );
 
     println!("Reading iPod database at {}…", ipod.display());
-    let mut database = Database::open(&ipod).with_context(|| {
-        format!(
-            "failed to open {}; ensure this is the mounted iPod root",
-            ipod.display()
-        )
-    })?;
+    let mut database = open_database_with_recovery(&ipod, cli.dry_run)?;
     println!("Device: {}", database.description());
     check_firewire_guid(&database, &ipod)?;
     if !source_playlists.is_empty() && !database.supports_playlists() {
@@ -144,6 +140,7 @@ fn run(cli: Cli) -> Result<()> {
     } else {
         let existing_track_keys: HashMap<_, _> = existing
             .iter()
+            .filter(|entry| !entry.track.media_missing)
             .map(|entry| (entry.track.handle, existing_key(&entry.track)))
             .collect();
         make_playlist_plan(
@@ -152,7 +149,20 @@ fn run(cli: Cli) -> Result<()> {
             &existing_track_keys,
         )
     };
+    let missing_track_keys: HashSet<_> = existing
+        .iter()
+        .filter(|entry| entry.track.media_missing)
+        .map(|entry| existing_key(&entry.track))
+        .collect();
+    let missing_references = existing
+        .iter()
+        .filter(|entry| entry.track.media_missing)
+        .count();
     let (kept, deleted, copied) = make_plan(&sources, existing);
+    let missing_recopies = copied
+        .iter()
+        .filter(|source| missing_track_keys.contains(&source_key(source)))
+        .count();
     // Devices without writable cover formats (Nano 1G/2G) cannot store
     // artwork at all; embedded source art is left out instead of failing.
     let artwork_capable = database.supports_artwork();
@@ -163,11 +173,13 @@ fn run(cli: Cli) -> Result<()> {
         .collect();
 
     println!(
-        "Plan: keep {}, delete {}, copy {}, add artwork to {}; keep {} playlist(s), create {}, update {}, delete {} obsolete prefixed playlist(s).",
+        "Plan: keep {}, delete {}, copy {}, add artwork to {}; repair {} missing media reference(s), including {} recopy; keep {} playlist(s), create {}, update {}, delete {} obsolete prefixed playlist(s).",
         kept.len(),
         deleted.len(),
         copied.len(),
         artwork_updates.len(),
+        missing_references,
+        missing_recopies,
         playlist_plan.kept.len(),
         playlist_plan.created.len(),
         playlist_plan.updated.len(),
@@ -179,7 +191,7 @@ fn run(cli: Cli) -> Result<()> {
     {
         println!("       (embedded artwork ignored: this device cannot store cover art)");
     }
-    print_plan(&deleted, &copied, &artwork_updates);
+    print_plan(&deleted, &copied, &artwork_updates, &missing_track_keys);
     print_playlist_plan(&playlist_plan);
 
     if cli.dry_run {
@@ -188,7 +200,11 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     for entry in &deleted {
-        println!("DELETE {}", describe_existing(&entry.track));
+        if entry.track.media_missing {
+            println!("REPAIR REMOVE {}", describe_existing(&entry.track));
+        } else {
+            println!("DELETE {}", describe_existing(&entry.track));
+        }
         database
             .remove_track(entry.track.handle)
             .with_context(|| format!("failed to delete {}", entry.track.path.display()))?;
@@ -225,8 +241,13 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     for source in &copied {
+        let operation = if missing_track_keys.contains(&source_key(source)) {
+            "REPAIR RECOPY"
+        } else {
+            "COPY         "
+        };
         println!(
-            "COPY   {} — {} ({})",
+            "{operation} {} — {} ({})",
             source.metadata.artist,
             source.metadata.title,
             source.path.display()
@@ -277,15 +298,85 @@ fn run(cli: Cli) -> Result<()> {
     };
 
     println!(
-        "Done: kept {}, deleted {}, copied {}, added artwork to {}; created {} playlist(s), updated {}, deleted {} obsolete prefixed playlist(s). Unmount/eject the iPod before unplugging it.",
+        "Done: kept {}, deleted {}, copied {}, added artwork to {}, repaired {} missing media reference(s); created {} playlist(s), updated {}, deleted {} obsolete prefixed playlist(s). Unmount/eject the iPod before unplugging it.",
         kept.len(),
         deleted.len(),
         copied.len(),
         artwork_updates.len(),
+        missing_references,
         playlist_plan.created.len(),
         playlist_plan.updated.len(),
         playlist_plan.deleted.len()
     );
+    Ok(())
+}
+
+fn open_database_with_recovery(ipod: &Path, dry_run: bool) -> Result<Database> {
+    refuse_renamed_transactions(ipod)?;
+    match Database::open(ipod) {
+        Ok(database) => Ok(database),
+        Err(error) if is_recovery_required(&error) => {
+            if dry_run {
+                bail!(
+                    "an interrupted libopod transaction requires recovery; dry-run will not modify it"
+                );
+            }
+            if !io::stdin().is_terminal() {
+                bail!(
+                    "an interrupted libopod transaction requires recovery; rerun copyPod interactively"
+                );
+            }
+            print!("An interrupted iPod transaction was found. Recover it now? [y/N] ");
+            io::stdout().flush().context("flush recovery prompt")?;
+            let mut answer = String::new();
+            io::stdin()
+                .read_line(&mut answer)
+                .context("read recovery confirmation")?;
+            if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                bail!("transaction recovery was declined; the iPod was not changed");
+            }
+            if !Database::recover_interrupted_transaction(ipod)? {
+                bail!("libopod reported no transaction to recover");
+            }
+            println!("Interrupted transaction recovered. Reopening the iPod database…");
+            Database::open(ipod).context("reopen the iPod after transaction recovery")
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to open {}; ensure this is the mounted iPod root",
+                ipod.display()
+            )
+        }),
+    }
+}
+
+fn is_recovery_required(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<libopod::Error>(),
+        Some(libopod::Error::RecoveryRequired { .. })
+    )
+}
+
+fn refuse_renamed_transactions(ipod: &Path) -> Result<()> {
+    const TRANSACTION: &str = ".libopod-transaction-v1";
+    let itunes = ipod.join("iPod_Control/iTunes");
+    if !itunes.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(&itunes)
+        .with_context(|| format!("inspect transaction directory in {}", itunes.display()))?
+    {
+        let entry = entry.with_context(|| format!("read an entry in {}", itunes.display()))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name != TRANSACTION && name.starts_with(TRANSACTION) {
+            bail!(
+                "possible renamed libopod transaction at {}; restore its name to {} before recovery",
+                entry.path().display(),
+                TRANSACTION
+            );
+        }
+    }
     Ok(())
 }
 
@@ -496,6 +587,10 @@ fn make_plan<'a>(
 
     for entry in existing {
         let key = existing_key(&entry.track);
+        if entry.track.media_missing {
+            deleted.push(entry);
+            continue;
+        }
         if let Some(source) = wanted.get(&key) {
             if matched.insert(key) {
                 kept.push(KeptTrack {
@@ -646,13 +741,24 @@ fn print_plan(
     deleted: &[ExistingTrack],
     copied: &[&SourceTrack],
     artwork_updates: &[&KeptTrack<'_>],
+    missing_track_keys: &HashSet<TrackKey>,
 ) {
     for entry in deleted {
-        println!("- {}", describe_existing(&entry.track));
+        let operation = if entry.track.media_missing {
+            "! repair dangling reference:"
+        } else {
+            "-"
+        };
+        println!("{operation} {}", describe_existing(&entry.track));
     }
     for source in copied {
+        let operation = if missing_track_keys.contains(&source_key(source)) {
+            "+ repair missing media:"
+        } else {
+            "+"
+        };
         println!(
-            "+ {} — {} ({})",
+            "{operation} {} — {} ({})",
             source.metadata.artist,
             source.metadata.title,
             source.path.display()
@@ -937,6 +1043,88 @@ fn is_unsupported_audio(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_metadata(title: &str) -> Metadata {
+        Metadata {
+            title: title.to_owned(),
+            album: "Album".to_owned(),
+            artist: "Artist".to_owned(),
+            album_artist: "Artist".to_owned(),
+            genre: String::new(),
+            comment: String::new(),
+            size: 123,
+            modified_at: 0,
+            duration_ms: 60_000,
+            bitrate_kbps: 128,
+            sample_rate_hz: 44_100,
+            year: 2024,
+            track_number: 1,
+            track_total: 1,
+            disc_number: 1,
+            disc_total: 1,
+        }
+    }
+
+    fn test_existing(title: &str, media_missing: bool) -> ExistingTrack {
+        ExistingTrack {
+            track: Track {
+                handle: TrackHandle::from_test_bits(1),
+                path: PathBuf::from(format!("/ipod/{title}.mp3")),
+                media_missing,
+                title: title.to_owned(),
+                album: "Album".to_owned(),
+                artist: "Artist".to_owned(),
+                album_artist: "Artist".to_owned(),
+                size: 123,
+                duration_ms: 60_000,
+                track_number: 1,
+                disc_number: 1,
+                has_artwork: false,
+            },
+        }
+    }
+
+    fn test_source(title: &str) -> SourceTrack {
+        SourceTrack {
+            path: PathBuf::from(format!("/source/{title}.mp3")),
+            metadata: test_metadata(title),
+            artwork: None,
+        }
+    }
+
+    #[test]
+    fn plans_missing_media_as_removal_and_optional_recopy() {
+        let wanted = [test_source("Wanted")];
+        let (kept, deleted, copied) = make_plan(&wanted, vec![test_existing("Wanted", true)]);
+        assert!(kept.is_empty());
+        assert_eq!(deleted.len(), 1);
+        assert!(deleted[0].track.media_missing);
+        assert_eq!(copied.len(), 1);
+        assert_eq!(copied[0].metadata.title, "Wanted");
+
+        let (kept, deleted, copied) = make_plan(&[], vec![test_existing("Obsolete", true)]);
+        assert!(kept.is_empty());
+        assert_eq!(deleted.len(), 1);
+        assert!(copied.is_empty());
+    }
+
+    #[test]
+    fn recognizes_recovery_errors_through_context() {
+        let error = anyhow::Error::new(libopod::Error::RecoveryRequired {
+            path: PathBuf::from("transaction"),
+        })
+        .context("open device");
+        assert!(is_recovery_required(&error));
+    }
+
+    #[test]
+    fn refuses_a_renamed_transaction_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let itunes = root.path().join("iPod_Control/iTunes");
+        fs::create_dir_all(&itunes).unwrap();
+        fs::create_dir(itunes.join(".libopod-transaction-v1-renamed")).unwrap();
+        assert!(refuse_renamed_transactions(root.path()).is_err());
+    }
 
     #[test]
     fn recognizes_mp3_case_insensitively() {
