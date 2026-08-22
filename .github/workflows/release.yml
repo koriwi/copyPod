@@ -10,62 +10,137 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  linux:
-    name: Linux x86_64
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            package: linux-x86_64
+          - name: Windows x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            package: windows-x86_64
+          - name: macOS Apple Silicon
+            os: macos-15
+            target: aarch64-apple-darwin
+            package: macos-aarch64
+          - name: macOS Intel
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            package: macos-x86_64
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      # Keep both repositories under one parent because copyPod uses
+      # `libopod-rs = { path = "../libopod" }`.
+      - name: Check out copyPod
+        uses: actions/checkout@v4
+        with:
+          path: copyPod
+
+      - name: Check out libopod
+        uses: actions/checkout@v4
+        with:
+          repository: koriwi/libopod
+          ref: ddce7feb911635f2959f2b726e64deb67513106b
+          path: libopod
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Test
+        working-directory: copyPod
+        run: cargo test --locked --target ${{ matrix.target }}
+
+      - name: Build release binary
+        working-directory: copyPod
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Package Unix binary
+        if: runner.os != 'Windows'
+        working-directory: copyPod
+        shell: bash
+        env:
+          PACKAGE: ${{ matrix.package }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          archive="copyPod-${PACKAGE}.tar.gz"
+          directory="copyPod-${PACKAGE}"
+
+          mkdir -p "dist/${directory}"
+          install -m 755 "target/${TARGET}/release/copyPod" "dist/${directory}/copyPod"
+          cp README.md LICENSE "dist/${directory}/"
+          tar -C dist -czf "dist/${archive}" "${directory}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "$archive" > "${archive}.sha256")
+          else
+            (cd dist && shasum -a 256 "$archive" > "${archive}.sha256")
+          fi
+
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        working-directory: copyPod
+        shell: pwsh
+        env:
+          PACKAGE: ${{ matrix.package }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $archive = "copyPod-$env:PACKAGE.zip"
+          $directory = "copyPod-$env:PACKAGE"
+
+          New-Item -ItemType Directory -Force "dist/$directory" | Out-Null
+          Copy-Item "target/$env:TARGET/release/copyPod.exe" "dist/$directory/copyPod.exe"
+          Copy-Item @("README.md", "LICENSE") -Destination "dist/$directory/"
+          Compress-Archive -Path "dist/$directory" -DestinationPath "dist/$archive"
+          $hash = (Get-FileHash "dist/$archive" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $archive" | Set-Content "dist/$archive.sha256" -Encoding ascii
+
+      - name: Upload packaged binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: copyPod-${{ matrix.package }}
+          path: |
+            copyPod/dist/*.tar.gz
+            copyPod/dist/*.zip
+            copyPod/dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
     runs-on: ubuntu-latest
 
     steps:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Install native dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends libgpod-dev pkg-config
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Test
-        run: cargo test --locked
-
-      - name: Build release binary
-        run: cargo build --locked --release
-
-      - name: Package binary
-        id: package
-        shell: bash
-        run: |
-          short_sha="$(git rev-parse --short=7 "$GITHUB_SHA")"
-          release_name="${GITHUB_REF_NAME}-${short_sha}"
-          archive="copyPod-linux-x86_64.tar.gz"
-
-          mkdir -p dist/copyPod-linux-x86_64
-          install -m 755 target/release/copyPod dist/copyPod-linux-x86_64/copyPod
-          cp README.md LICENSE dist/copyPod-linux-x86_64/
-          tar -C dist -czf "dist/${archive}" copyPod-linux-x86_64
-          (cd dist && sha256sum "$archive" > "${archive}.sha256")
-
-          echo "release_name=${release_name}" >> "$GITHUB_OUTPUT"
-          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+      - name: Download packaged binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: copyPod-*
+          path: dist
+          merge-multiple: true
 
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_NAME: ${{ steps.package.outputs.release_name }}
-          ARCHIVE: ${{ steps.package.outputs.archive }}
         shell: bash
         run: |
-          if gh release view "$RELEASE_NAME" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_NAME" \
-              "dist/$ARCHIVE" \
-              "dist/$ARCHIVE.sha256" \
-              --clobber
+          short_sha="$(git rev-parse --short=7 "$GITHUB_SHA")"
+          release_name="${GITHUB_REF_NAME}-${short_sha}"
+          files=(dist/*)
+
+          if gh release view "$release_name" >/dev/null 2>&1; then
+            gh release upload "$release_name" "${files[@]}" --clobber
           else
-            gh release create "$RELEASE_NAME" \
-              "dist/$ARCHIVE" \
-              "dist/$ARCHIVE.sha256" \
+            gh release create "$release_name" "${files[@]}" \
               --target "$GITHUB_SHA" \
-              --title "$RELEASE_NAME" \
+              --title "$release_name" \
               --generate-notes
           fi

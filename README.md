@@ -3,7 +3,7 @@
 > [!CAUTION]
 > **This project is vibecoded. Back up your iPod and use it at your own risk.**
 
-copyPod is a small Linux command-line tool for putting MP3s on an iPod running
+copyPod is a small command-line tool for putting MP3s on an iPod running
 Apple's original firmware. Give it one or more music folders and the iPod's
 mount point; copyPod scans the folders recursively and makes the iPod's music
 library match them.
@@ -31,8 +31,8 @@ recoverable transaction on supported iPod profiles.
 
 ## Requirements
 
-- Linux
-- Rust toolchain
+- Linux, macOS, or Windows
+- Rust toolchain (when building from source)
 - A sibling checkout of the in-development `libopod` crate
 - A mounted, non-Rockbox iPod with a libopod read adapter
 - MP3 files; other audio formats are not supported yet
@@ -49,17 +49,25 @@ sudo pacman -S --needed base-devel rust
 sudo apt install build-essential cargo
 ```
 
+## Downloads
+
+Each pushed revision publishes release archives for Linux x86_64, Windows
+x86_64, macOS Apple Silicon, and macOS Intel on the GitHub Releases page. Each
+archive has a matching SHA-256 checksum file.
+
 ## Build
 
 ```bash
 # Place the libopod and copyPod checkouts next to each other:
 # parent/libopod and parent/copyPod
+git clone https://github.com/koriwi/libopod.git
 git clone https://github.com/koriwi/copyPod.git
 cd copyPod
 cargo build --release
 ```
 
-The binary is written to `target/release/copyPod`. To install it for your user:
+The binary is written to `target/release/copyPod` (`copyPod.exe` on Windows).
+To install it for your user on Linux or macOS:
 
 ```bash
 install -Dm755 target/release/copyPod ~/.local/bin/copyPod
