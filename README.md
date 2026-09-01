@@ -148,8 +148,10 @@ missing title falls back to the filename; missing artist and album tags become
 
 ## Podcasts
 
-On the Nano 7G, an MP3 carrying the standard ID3 `PCST` podcast marker is
-stored as a podcast instead of a normal song. Podcasts are placed in the
+On the Nano 7G, an MP3 carrying the native ID3 `PCST` podcast marker is
+stored as a podcast instead of a normal song. For compatibility with metadata
+editors such as Metadata Remote, copyPod also accepts case-insensitive
+`TXXX:PCST=1` and `TXXX:podcast=1` text fields. Podcasts are placed in the
 special hidden Podcasts container, excluded from shuffle, configured to resume
 playback, and initially marked unplayed. If the marker changes on an existing
 item, copyPod replaces it so its media kind changes too.

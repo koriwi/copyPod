@@ -1074,6 +1074,27 @@ fn has_id3_podcast_marker(tag: &lofty::tag::Tag) -> bool {
     let id3v2: lofty::id3::v2::Id3v2Tag = tag.clone().into();
     let frame_id = lofty::id3::v2::FrameId::new("PCST").expect("PCST is a valid frame ID");
     id3v2.get(&frame_id).is_some()
+        || (&id3v2).into_iter().any(|frame| {
+            matches!(
+                frame,
+                lofty::id3::v2::Frame::UserText(text)
+                    if is_podcast_text_key(&text.description)
+                        && text.content.split('\0').any(is_enabled_podcast_text)
+            )
+        })
+}
+
+fn is_podcast_text_key(key: &str) -> bool {
+    let key = key.trim();
+    let key = key
+        .split_once(':')
+        .filter(|(prefix, _)| prefix.eq_ignore_ascii_case("TXXX"))
+        .map_or(key, |(_, description)| description.trim());
+    key.eq_ignore_ascii_case("PCST") || key.eq_ignore_ascii_case("podcast")
+}
+
+fn is_enabled_podcast_text(value: &str) -> bool {
+    value.trim() == "1"
 }
 
 fn read_external_artwork(track_path: &Path) -> Result<Option<Artwork>> {
@@ -1298,6 +1319,31 @@ mod tests {
         ));
         let binary_marker: lofty::tag::Tag = id3v2.into();
         assert!(has_id3_podcast_marker(&binary_marker));
+
+        for description in ["pCsT", "PoDcAsT"] {
+            let mut id3v2 = lofty::id3::v2::Id3v2Tag::new();
+            id3v2.insert(lofty::id3::v2::Frame::UserText(
+                lofty::id3::v2::ExtendedTextFrame::new(
+                    lofty::TextEncoding::UTF8,
+                    description.to_owned(),
+                    "1".to_owned(),
+                ),
+            ));
+            let text_marker: lofty::tag::Tag = id3v2.into();
+            assert!(has_id3_podcast_marker(&text_marker));
+        }
+
+        let mut id3v2 = lofty::id3::v2::Id3v2Tag::new();
+        id3v2.insert(lofty::id3::v2::Frame::UserText(
+            lofty::id3::v2::ExtendedTextFrame::new(
+                lofty::TextEncoding::UTF8,
+                "PCST".to_owned(),
+                "0".to_owned(),
+            ),
+        ));
+        let disabled_text_marker: lofty::tag::Tag = id3v2.into();
+        assert!(!has_id3_podcast_marker(&disabled_text_marker));
+        assert!(is_podcast_text_key("tXxX:pOdCaSt"));
     }
 
     #[test]
