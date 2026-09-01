@@ -4,7 +4,9 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use libopod::{BackendKind, ChecksumKind, Device, MediaDeletionPolicy, PersistentId, TrackToAdd};
+use libopod::{
+    BackendKind, ChecksumKind, Device, MediaDeletionPolicy, MediaKind, PersistentId, TrackToAdd,
+};
 
 #[derive(Clone, Debug)]
 pub struct Metadata {
@@ -26,6 +28,7 @@ pub struct Metadata {
     pub track_total: u32,
     pub disc_number: u32,
     pub disc_total: u32,
+    pub media_kind: MediaKind,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -62,6 +65,7 @@ pub struct Track {
     pub track_number: u32,
     pub disc_number: u32,
     pub has_artwork: bool,
+    pub media_kind: MediaKind,
 }
 
 #[derive(Debug)]
@@ -146,6 +150,11 @@ impl Database {
             .is_some_and(|profile| profile.capabilities().supports_artwork())
     }
 
+    /// Whether this device has qualified podcast write support.
+    pub fn supports_podcasts(&self) -> bool {
+        self.device.profile().map(libopod::DeviceProfile::key) == Some("nano-7g")
+    }
+
     /// Whether libopod supports playlist mutations for this device profile.
     pub fn supports_playlists(&self) -> bool {
         self.device.profile().is_some_and(|profile| {
@@ -197,6 +206,7 @@ impl Database {
                     track_number: track.track_number,
                     disc_number: track.disc_number,
                     has_artwork: track.has_artwork,
+                    media_kind: track.media_kind,
                 })
             })
             .collect()
@@ -357,6 +367,7 @@ impl Database {
                         sample_rate: change.metadata.sample_rate_hz,
                         length_ms: change.metadata.duration_ms,
                         compilation: false,
+                        media_kind: change.metadata.media_kind,
                         reuse_album_art: false,
                         artwork_source,
                     };

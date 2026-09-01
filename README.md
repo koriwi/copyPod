@@ -18,7 +18,8 @@ of those sources.
 - Recursively syncs any number of folders
 - Syncs only the tracks referenced by selected `.m3u` and `.m3u8` files
 - Accepts individual playlists or recursively scanned playlist folders
-- Creates and updates standard iPod playlists
+- Creates and updates standard iPod playlists and removes empty ones
+- Imports MP3s carrying the ID3 `PCST` marker as podcasts on the Nano 7G
 - Skips existing tracks without reading and hashing every file on the iPod
 - Matches tracks using tags, exact file size, duration, and track/disc numbers
 - Reads cover art embedded in MP3s
@@ -121,9 +122,11 @@ copies already on the iPod. Files must use UTF-8. Entries may use absolute paths
 or paths relative to the M3U file; blank lines, comments, and extended-M3U
 metadata lines are ignored. Tracks in explicitly selected `-p` playlists may be
 anywhere on disk. Missing, unreadable, and non-MP3 entries are errors. Existing
-standard playlists with the same name are updated, while unrelated iPod
-playlists are preserved. Playlist writes work on the Nano 7G and classic
-binary-iTunesDB models supported by libopod.
+standard playlists with the same name are updated. Empty editable standard
+playlists are deleted automatically, including empty M3Us and unrelated
+playlists emptied by track removal; hidden and smart playlists are preserved.
+Playlist writes work on the Nano 7G and classic binary-iTunesDB models
+supported by libopod.
 
 `-i/--ipod` must be the mounted filesystem path, **not** `/dev/sdX`.
 
@@ -137,10 +140,22 @@ stored in the iPod's authoritative library with the local MP3:
 - exact file size
 - duration, rounded to a second
 - track and disc number
+- media kind (song or podcast)
 
 Tag text is compared case-insensitively and extra whitespace is ignored. A
 missing title falls back to the filename; missing artist and album tags become
 `Unknown Artist` and `Unknown Album`.
+
+## Podcasts
+
+On the Nano 7G, an MP3 carrying the standard ID3 `PCST` podcast marker is
+stored as a podcast instead of a normal song. Podcasts are placed in the
+special hidden Podcasts container, excluded from shuffle, configured to resume
+playback, and initially marked unplayed. If the marker changes on an existing
+item, copyPod replaces it so its media kind changes too.
+
+Podcast writes on other iPod profiles are not qualified yet. copyPod stops with
+an error instead of silently importing a marked podcast as a song.
 
 ## Cover art
 

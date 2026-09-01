@@ -12,9 +12,11 @@ use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::picture::PictureType;
 use lofty::prelude::Accessor;
 use lofty::probe::Probe;
+use lofty::tag::ItemKey;
 use walkdir::WalkDir;
 
 use crate::opod::{Database, Metadata, Playlist, PlaylistHandle, Track, TrackHandle};
+use libopod::MediaKind;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -62,6 +64,7 @@ struct TrackKey {
     duration_seconds: u32,
     track_number: u32,
     disc_number: u32,
+    media_kind: MediaKind,
 }
 
 #[derive(Debug)]
@@ -149,22 +152,17 @@ fn run(cli: Cli) -> Result<()> {
             source_playlists.len()
         );
     }
+    let podcast_count = sources
+        .iter()
+        .filter(|source| source.metadata.media_kind == MediaKind::Podcast)
+        .count();
+    if podcast_count != 0 && !database.supports_podcasts() {
+        bail!(
+            "{podcast_count} MP3(s) carry the ID3 podcast marker, but podcast writes are currently supported only on the Nano 7G"
+        );
+    }
 
     let existing = read_existing_tracks(&database)?;
-    let playlist_plan = if source_playlists.is_empty() {
-        PlaylistPlan::default()
-    } else {
-        let existing_track_keys: HashMap<_, _> = existing
-            .iter()
-            .filter(|entry| !entry.track.media_missing)
-            .map(|entry| (entry.track.handle, existing_key(&entry.track)))
-            .collect();
-        make_playlist_plan(
-            &source_playlists,
-            database.playlists()?,
-            &existing_track_keys,
-        )
-    };
     let missing_track_keys: HashSet<_> = existing
         .iter()
         .filter(|entry| entry.track.media_missing)
@@ -175,6 +173,24 @@ fn run(cli: Cli) -> Result<()> {
         .filter(|entry| entry.track.media_missing)
         .count();
     let (kept, deleted, copied) = make_plan(&sources, existing);
+    let playlist_plan = if database.supports_playlists() {
+        let retained_track_keys: HashMap<_, _> = kept
+            .iter()
+            .map(|entry| {
+                (
+                    entry.existing.track.handle,
+                    existing_key(&entry.existing.track),
+                )
+            })
+            .collect();
+        make_playlist_plan(
+            &source_playlists,
+            database.playlists()?,
+            &retained_track_keys,
+        )
+    } else {
+        PlaylistPlan::default()
+    };
     let missing_recopies = copied
         .iter()
         .filter(|source| missing_track_keys.contains(&source_key(source)))
@@ -189,7 +205,7 @@ fn run(cli: Cli) -> Result<()> {
         .collect();
 
     println!(
-        "Plan: keep {}, delete {}, copy {}, add artwork to {}; repair {} missing media reference(s), including {} recopy; keep {} playlist(s), create {}, update {}, delete {} obsolete prefixed playlist(s).",
+        "Plan: keep {}, delete {}, copy {}, add artwork to {}; repair {} missing media reference(s), including {} recopy; keep {} playlist(s), create {}, update {}, delete {} empty or obsolete playlist(s).",
         kept.len(),
         deleted.len(),
         copied.len(),
@@ -259,6 +275,8 @@ fn run(cli: Cli) -> Result<()> {
     for source in &copied {
         let operation = if missing_track_keys.contains(&source_key(source)) {
             "REPAIR RECOPY"
+        } else if source.metadata.media_kind == MediaKind::Podcast {
+            "PODCAST COPY"
         } else {
             "COPY         "
         };
@@ -765,10 +783,19 @@ fn make_playlist_plan<'a>(
 
         let existing_playlist = exact.or_else(|| legacy.first().copied());
         let Some(existing_playlist) = existing_playlist else {
-            created.push(source);
+            if !source.tracks.is_empty() {
+                created.push(source);
+            }
             continue;
         };
         matched.insert(existing_playlist.handle);
+        if source.tracks.is_empty() {
+            deleted.push(PlaylistDeletion {
+                name: existing_playlist.name.clone(),
+                handle: existing_playlist.handle,
+            });
+            continue;
+        }
         let existing_keys: Option<Vec<_>> = existing_playlist
             .tracks
             .iter()
@@ -784,6 +811,21 @@ fn make_playlist_plan<'a>(
                 handle: existing_playlist.handle,
             });
         }
+    }
+
+    for playlist in existing.iter().filter(|playlist| {
+        !playlist.is_hidden
+            && !playlist.is_smart
+            && playlist
+                .tracks
+                .iter()
+                .all(|track| !track_keys.contains_key(track))
+            && !matched.contains(&playlist.handle)
+    }) {
+        deleted.push(PlaylistDeletion {
+            name: playlist.name.clone(),
+            handle: playlist.handle,
+        });
     }
 
     PlaylistPlan {
@@ -803,7 +845,7 @@ fn apply_playlist_plan(
         println!("PLAYLIST - {}", playlist.name);
         database
             .delete_playlist(playlist.handle)
-            .with_context(|| format!("failed to delete obsolete playlist {}", playlist.name))?;
+            .with_context(|| format!("failed to delete playlist {}", playlist.name))?;
     }
     for source in &plan.created {
         let tracks = resolve_playlist_handles(source, handles_by_key)?;
@@ -882,7 +924,7 @@ fn print_plan(
 
 fn print_playlist_plan(plan: &PlaylistPlan<'_>) {
     for playlist in &plan.deleted {
-        println!("- obsolete playlist: {}", playlist.name);
+        println!("- empty or obsolete playlist: {}", playlist.name);
     }
     for source in &plan.created {
         println!("+ playlist: {} ({})", source.name, source.path.display());
@@ -960,6 +1002,14 @@ fn read_source_track(path: PathBuf) -> Result<SourceTrack> {
         .and_then(|tag| tag.comment())
         .map(|value| value.trim().to_owned())
         .unwrap_or_default();
+    let media_kind = if tagged_file
+        .tag(lofty::tag::TagType::Id3v2)
+        .is_some_and(has_id3_podcast_marker)
+    {
+        MediaKind::Podcast
+    } else {
+        MediaKind::Song
+    };
 
     let duration_ms = properties.duration().as_millis().min(u128::from(u32::MAX)) as u32;
     let modified_at = file_metadata
@@ -985,6 +1035,7 @@ fn read_source_track(path: PathBuf) -> Result<SourceTrack> {
         track_total: tag.and_then(|tag| tag.track_total()).unwrap_or(0),
         disc_number: tag.and_then(|tag| tag.disk()).unwrap_or(0),
         disc_total: tag.and_then(|tag| tag.disk_total()).unwrap_or(0),
+        media_kind,
     };
 
     let embedded = tag.and_then(|tag| {
@@ -1007,6 +1058,22 @@ fn read_source_track(path: PathBuf) -> Result<SourceTrack> {
         metadata,
         artwork,
     })
+}
+
+fn has_id3_podcast_marker(tag: &lofty::tag::Tag) -> bool {
+    if let Some(item) = tag.get(&ItemKey::FlagPodcast) {
+        return item.value().text().is_none_or(|value| {
+            !["0", "false", "no"]
+                .iter()
+                .any(|false_value| value.trim().eq_ignore_ascii_case(false_value))
+        });
+    }
+    if tag.tag_type() != lofty::tag::TagType::Id3v2 {
+        return false;
+    }
+    let id3v2: lofty::id3::v2::Id3v2Tag = tag.clone().into();
+    let frame_id = lofty::id3::v2::FrameId::new("PCST").expect("PCST is a valid frame ID");
+    id3v2.get(&frame_id).is_some()
 }
 
 fn read_external_artwork(track_path: &Path) -> Result<Option<Artwork>> {
@@ -1060,6 +1127,7 @@ fn source_key(source: &SourceTrack) -> TrackKey {
         source.metadata.duration_ms,
         source.metadata.track_number,
         source.metadata.disc_number,
+        source.metadata.media_kind,
     )
 }
 
@@ -1073,6 +1141,7 @@ fn existing_key(track: &Track) -> TrackKey {
         track.duration_ms,
         track.track_number,
         track.disc_number,
+        track.media_kind,
     )
 }
 
@@ -1086,6 +1155,7 @@ fn metadata_key(
     duration_ms: u32,
     track_number: u32,
     disc_number: u32,
+    media_kind: MediaKind,
 ) -> TrackKey {
     // The track artist identifies the recording; album artist is grouping
     // metadata and can legitimately differ on compilations. Some classic iPod
@@ -1105,6 +1175,7 @@ fn metadata_key(
         duration_seconds: duration_ms.saturating_add(500) / 1_000,
         track_number,
         disc_number,
+        media_kind,
     }
 }
 
@@ -1180,6 +1251,7 @@ mod tests {
             track_total: 1,
             disc_number: 1,
             disc_total: 1,
+            media_kind: MediaKind::Song,
         }
     }
 
@@ -1198,6 +1270,7 @@ mod tests {
                 track_number: 1,
                 disc_number: 1,
                 has_artwork: false,
+                media_kind: MediaKind::Song,
             },
         }
     }
@@ -1208,6 +1281,35 @@ mod tests {
             metadata: test_metadata(title),
             artwork: None,
         }
+    }
+
+    #[test]
+    fn detects_the_standard_id3_podcast_marker() {
+        let mut tag = lofty::tag::Tag::new(lofty::tag::TagType::Id3v2);
+        assert!(tag.insert_text(ItemKey::FlagPodcast, "1".to_owned()));
+        assert!(has_id3_podcast_marker(&tag));
+        assert!(tag.insert_text(ItemKey::FlagPodcast, "0".to_owned()));
+        assert!(!has_id3_podcast_marker(&tag));
+
+        let mut id3v2 = lofty::id3::v2::Id3v2Tag::new();
+        let frame_id = lofty::id3::v2::FrameId::new("PCST").unwrap().into_owned();
+        id3v2.insert(lofty::id3::v2::Frame::Binary(
+            lofty::id3::v2::BinaryFrame::new(frame_id, Vec::new()),
+        ));
+        let binary_marker: lofty::tag::Tag = id3v2.into();
+        assert!(has_id3_podcast_marker(&binary_marker));
+    }
+
+    #[test]
+    fn changing_a_song_to_a_podcast_replaces_the_item() {
+        let mut wanted = test_source("Episode");
+        wanted.metadata.media_kind = MediaKind::Podcast;
+        let sources = [wanted];
+        let (kept, deleted, copied) = make_plan(&sources, vec![test_existing("Episode", false)]);
+        assert!(kept.is_empty());
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(copied.len(), 1);
+        assert_eq!(copied[0].metadata.media_kind, MediaKind::Podcast);
     }
 
     #[test]
@@ -1276,9 +1378,30 @@ mod tests {
             61_200,
             2,
             1,
+            MediaKind::Song,
         );
-        let same = metadata_key("", "some artist", "album", " song ", 12_345, 61_499, 2, 1);
-        let different_size = metadata_key("", "some artist", "album", "song", 12_346, 61_200, 2, 1);
+        let same = metadata_key(
+            "",
+            "some artist",
+            "album",
+            " song ",
+            12_345,
+            61_499,
+            2,
+            1,
+            MediaKind::Song,
+        );
+        let different_size = metadata_key(
+            "",
+            "some artist",
+            "album",
+            "song",
+            12_346,
+            61_200,
+            2,
+            1,
+            MediaKind::Song,
+        );
 
         assert_eq!(first, same);
         assert_ne!(first, different_size);
@@ -1286,15 +1409,54 @@ mod tests {
 
     #[test]
     fn track_key_falls_back_to_album_artist_when_artist_is_missing() {
-        let album_artist = metadata_key("Artist", "", "Album", "Song", 1, 1, 0, 0);
-        let track_artist = metadata_key("", "Artist", "Album", "Song", 1, 1, 0, 0);
+        let album_artist = metadata_key("Artist", "", "Album", "Song", 1, 1, 0, 0, MediaKind::Song);
+        let track_artist = metadata_key("", "Artist", "Album", "Song", 1, 1, 0, 0, MediaKind::Song);
 
         assert_eq!(album_artist, track_artist);
     }
 
     #[test]
+    fn deletes_empty_standard_playlists_by_default() {
+        let empty = Playlist {
+            handle: PlaylistHandle::from_test_bits(10),
+            name: "Empty".to_owned(),
+            tracks: Vec::new(),
+            is_hidden: false,
+            is_smart: false,
+        };
+        let hidden = Playlist {
+            handle: PlaylistHandle::from_test_bits(11),
+            name: "Hidden".to_owned(),
+            tracks: Vec::new(),
+            is_hidden: true,
+            is_smart: false,
+        };
+        let plan = make_playlist_plan(&[], vec![empty, hidden], &HashMap::new());
+        assert_eq!(plan.deleted.len(), 1);
+        assert_eq!(plan.deleted[0].name, "Empty");
+
+        let source = SourcePlaylist {
+            name: "Explicitly Empty".to_owned(),
+            path: PathBuf::from("Explicitly Empty.m3u"),
+            tracks: Vec::new(),
+        };
+        let existing = Playlist {
+            handle: PlaylistHandle::from_test_bits(12),
+            name: "Explicitly Empty".to_owned(),
+            tracks: vec![TrackHandle::from_test_bits(1)],
+            is_hidden: false,
+            is_smart: false,
+        };
+        let sources = [source];
+        let plan = make_playlist_plan(&sources, vec![existing], &HashMap::new());
+        assert!(plan.created.is_empty());
+        assert_eq!(plan.deleted.len(), 1);
+        assert_eq!(plan.deleted[0].name, "Explicitly Empty");
+    }
+
+    #[test]
     fn removes_obsolete_prefixed_playlist_when_clean_name_exists() {
-        let track_key = metadata_key("", "Artist", "Album", "Song", 1, 1, 0, 0);
+        let track_key = metadata_key("", "Artist", "Album", "Song", 1, 1, 0, 0, MediaKind::Song);
         let track = TrackHandle::from_test_bits(1);
         let clean = PlaylistHandle::from_test_bits(2);
         let prefixed = PlaylistHandle::from_test_bits(3);
@@ -1345,8 +1507,8 @@ mod tests {
         )
         .unwrap();
 
-        let first_key = metadata_key("", "a", "b", "one", 1, 1, 0, 0);
-        let second_key = metadata_key("", "a", "b", "two", 1, 1, 0, 0);
+        let first_key = metadata_key("", "a", "b", "one", 1, 1, 0, 0, MediaKind::Song);
+        let second_key = metadata_key("", "a", "b", "two", 1, 1, 0, 0, MediaKind::Song);
         let keys = HashMap::from([
             (first.canonicalize().unwrap(), first_key.clone()),
             (second.canonicalize().unwrap(), second_key.clone()),
