@@ -4,19 +4,21 @@
 > **This project is vibecoded. Back up your iPod and use it at your own risk.**
 
 copyPod is a small command-line tool for putting MP3s on an iPod running
-Apple's original firmware. Give it one or more music folders and the iPod's
-mount point; copyPod scans the folders recursively and makes the iPod's music
-library match them.
+Apple's original firmware. Give it music folders, M3U playlists, or both plus
+the iPod's mount point; copyPod makes the iPod's music library match the union
+of those sources.
 
 > [!WARNING]
 > copyPod is a full-mirror tool. Tracks that do not match anything in the given
-> folders are removed from the iPod, even if they were added with Rhythmbox,
+> sources are removed from the iPod, even if they were added with Rhythmbox,
 > iTunes, or another program. Run with `--dry-run` first.
 
 ## Features
 
 - Recursively syncs any number of folders
-- Creates and updates iPod playlists from `.m3u` and `.m3u8` files
+- Syncs only the tracks referenced by selected `.m3u` and `.m3u8` files
+- Accepts individual playlists or recursively scanned playlist folders
+- Creates and updates standard iPod playlists
 - Skips existing tracks without reading and hashing every file on the iPod
 - Matches tracks using tags, exact file size, duration, and track/disc numbers
 - Reads cover art embedded in MP3s
@@ -94,17 +96,34 @@ copyPod \
   -i /run/media/$USER/IPOD
 ```
 
-`-l/--library` may be supplied more than once. Each folder is scanned
-recursively; its directory layout is not copied to the iPod.
+At least one `-l/--library` or `-p/--playlist` source is required. Both options
+may be supplied more than once and may be combined:
 
-M3U and M3U8 files within those folders become standard iPod playlists. The
-playlist filename (without its extension) becomes the playlist name; copyPod
-removes the leading `000 ` sorting prefix used by rocksonic-rs and cleans up
-obsolete prefixed copies already on the iPod. Files must use UTF-8. Entries may use absolute paths or paths relative to the M3U file;
-blank lines, comments, and extended-M3U metadata lines are ignored. Referenced
-tracks must be MP3s in one of the supplied library folders. Existing standard playlists with the same
-name are updated, while unrelated iPod playlists are preserved. Playlist writes
-work on the Nano 7G and classic binary-iTunesDB models supported by libopod.
+```bash
+copyPod \
+  -l ~/Musik/albums \
+  -p ~/Musik/playlists/favorites.m3u \
+  -p ~/Musik/playlists/portable \
+  -i /run/media/$USER/IPOD \
+  --dry-run
+```
+
+Each `-l` folder is scanned recursively and contributes every MP3 it contains;
+its directory layout is not copied to the iPod. Each `-p` path can be an M3U or
+M3U8 file, or a directory scanned recursively for playlists. A selected
+playlist contributes only its referenced MP3s. When both options are used,
+copyPod mirrors the union of their tracks, with duplicate tracks copied once.
+
+M3U and M3U8 files become standard iPod playlists. The playlist filename
+(without its extension) becomes the playlist name; copyPod removes the leading
+`000 ` sorting prefix used by rocksonic-rs and cleans up obsolete prefixed
+copies already on the iPod. Files must use UTF-8. Entries may use absolute paths
+or paths relative to the M3U file; blank lines, comments, and extended-M3U
+metadata lines are ignored. Tracks in explicitly selected `-p` playlists may be
+anywhere on disk. Missing, unreadable, and non-MP3 entries are errors. Existing
+standard playlists with the same name are updated, while unrelated iPod
+playlists are preserved. Playlist writes work on the Nano 7G and classic
+binary-iTunesDB models supported by libopod.
 
 `-i/--ipod` must be the mounted filesystem path, **not** `/dev/sdX`.
 

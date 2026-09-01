@@ -2,7 +2,7 @@
 name = "copypod"
 version = "0.1.0"
 edition = "2021"
-description = "Mirror local MP3 folders to a classic iPod"
+description = "Mirror local MP3 folders and M3U playlists to a classic iPod"
 license = "MIT"
 
 [[bin]]

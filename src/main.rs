@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::picture::PictureType;
 use lofty::prelude::Accessor;
@@ -20,13 +20,23 @@ use crate::opod::{Database, Metadata, Playlist, PlaylistHandle, Track, TrackHand
 #[command(
     name = "copyPod",
     version,
-    about = "Mirror one or more local MP3 folders to a classic iPod",
-    after_help = "WARNING: every iPod track not present in the supplied libraries is deleted.\nRun with --dry-run first if you are unsure."
+    about = "Mirror local MP3 folders and M3U playlists to a classic iPod",
+    after_help = "WARNING: every iPod track not present in the supplied sources is deleted.\nRun with --dry-run first if you are unsure.",
+    group(
+        ArgGroup::new("sources")
+            .required(true)
+            .multiple(true)
+            .args(["libraries", "playlist_inputs"])
+    )
 )]
 struct Cli {
     /// Local library folder to scan recursively; may be supplied multiple times
-    #[arg(short = 'l', long = "library", required = true, value_name = "PATH")]
+    #[arg(short = 'l', long = "library", value_name = "PATH")]
     libraries: Vec<PathBuf>,
+
+    /// M3U file or folder of M3U files; may be supplied multiple times
+    #[arg(short = 'p', long = "playlist", value_name = "PATH")]
+    playlist_inputs: Vec<PathBuf>,
 
     /// Mounted iPod filesystem (not /dev/sdX)
     #[arg(short = 'i', long = "ipod", value_name = "MOUNTPOINT")]
@@ -108,10 +118,16 @@ fn main() {
 
 fn run(cli: Cli) -> Result<()> {
     let libraries = validate_libraries(&cli.libraries)?;
+    let playlist_inputs = validate_playlist_inputs(&cli.playlist_inputs)?;
     let ipod = validate_ipod(&cli.ipod)?;
 
-    println!("Scanning {} source folder(s)…", libraries.len());
-    let (sources, source_playlists, duplicate_sources) = scan_sources(&libraries)?;
+    println!(
+        "Scanning {} library folder(s) and {} playlist source(s)…",
+        libraries.len(),
+        playlist_inputs.len()
+    );
+    let (sources, source_playlists, duplicate_sources) =
+        scan_sources(&libraries, &playlist_inputs)?;
     println!(
         "Found {} unique MP3 file(s){} and {} M3U playlist(s).",
         sources.len(),
@@ -412,6 +428,25 @@ fn validate_libraries(libraries: &[PathBuf]) -> Result<Vec<PathBuf>> {
         .collect()
 }
 
+fn validate_playlist_inputs(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    inputs
+        .iter()
+        .map(|path| {
+            let canonical = path
+                .canonicalize()
+                .with_context(|| format!("playlist source does not exist: {}", path.display()))?;
+            if canonical.is_dir() || canonical.is_file() && is_m3u(&canonical) {
+                Ok(canonical)
+            } else {
+                bail!(
+                    "playlist source is not an M3U/M3U8 file or directory: {}",
+                    path.display()
+                )
+            }
+        })
+        .collect()
+}
+
 fn validate_ipod(ipod: &Path) -> Result<PathBuf> {
     let canonical = ipod
         .canonicalize()
@@ -428,7 +463,37 @@ fn validate_ipod(ipod: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-fn scan_sources(libraries: &[PathBuf]) -> Result<(Vec<SourceTrack>, Vec<SourcePlaylist>, usize)> {
+fn discover_playlist_paths(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for input in inputs {
+        if input.is_file() {
+            paths.push(input.clone());
+            continue;
+        }
+        let mut found = false;
+        for entry in WalkDir::new(input).follow_links(false) {
+            let entry = entry.with_context(|| format!("could not scan {}", input.display()))?;
+            if entry.file_type().is_file() && is_m3u(entry.path()) {
+                paths.push(entry.into_path());
+                found = true;
+            }
+        }
+        if !found {
+            bail!(
+                "playlist directory contains no M3U/M3U8 files: {}",
+                input.display()
+            );
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn scan_sources(
+    libraries: &[PathBuf],
+    playlist_inputs: &[PathBuf],
+) -> Result<(Vec<SourceTrack>, Vec<SourcePlaylist>, usize)> {
     let mut track_paths = Vec::new();
     let mut playlist_paths = Vec::new();
     for library in libraries {
@@ -450,8 +515,23 @@ fn scan_sources(libraries: &[PathBuf]) -> Result<(Vec<SourceTrack>, Vec<SourcePl
             }
         }
     }
-    track_paths.sort();
+
+    let selected_playlist_paths = discover_playlist_paths(playlist_inputs)?;
+    let selected_playlists: HashSet<_> = selected_playlist_paths.iter().cloned().collect();
+    playlist_paths.extend(selected_playlist_paths);
     playlist_paths.sort();
+    playlist_paths.dedup();
+
+    let mut entries_by_playlist = HashMap::new();
+    for path in &playlist_paths {
+        let entries = read_playlist_entries(path)?;
+        if selected_playlists.contains(path) {
+            track_paths.extend(entries.iter().cloned());
+        }
+        entries_by_playlist.insert(path.clone(), entries);
+    }
+    track_paths.sort();
+    track_paths.dedup();
 
     let mut seen = HashSet::new();
     let mut tracks = Vec::new();
@@ -467,12 +547,61 @@ fn scan_sources(libraries: &[PathBuf]) -> Result<(Vec<SourceTrack>, Vec<SourcePl
         }
         tracks.push(track);
     }
-    let playlists = read_source_playlists(&playlist_paths, &keys_by_path)?;
+    let playlists = read_source_playlists(&playlist_paths, &entries_by_playlist, &keys_by_path)?;
     Ok((tracks, playlists, duplicates))
+}
+
+fn read_playlist_entries(path: &Path) -> Result<Vec<PathBuf>> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("could not read M3U playlist: {}", path.display()))?;
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+    let contents = std::str::from_utf8(bytes)
+        .with_context(|| format!("M3U playlist is not UTF-8: {}", path.display()))?;
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tracks = Vec::new();
+    for (line_index, line) in contents.lines().enumerate() {
+        let entry = line.trim();
+        if entry.is_empty() || entry.starts_with('#') {
+            continue;
+        }
+        let referenced = Path::new(entry);
+        let referenced = if referenced.is_absolute() {
+            referenced.to_path_buf()
+        } else {
+            directory.join(referenced)
+        };
+        let referenced = referenced.canonicalize().with_context(|| {
+            format!(
+                "{}:{} references a missing track: {}",
+                path.display(),
+                line_index + 1,
+                entry
+            )
+        })?;
+        if !referenced.is_file() {
+            bail!(
+                "{}:{} does not reference a regular file: {}",
+                path.display(),
+                line_index + 1,
+                referenced.display()
+            );
+        }
+        if !is_mp3(&referenced) {
+            bail!(
+                "{}:{} references an unsupported non-MP3 track: {}",
+                path.display(),
+                line_index + 1,
+                referenced.display()
+            );
+        }
+        tracks.push(referenced);
+    }
+    Ok(tracks)
 }
 
 fn read_source_playlists(
     paths: &[PathBuf],
+    entries_by_playlist: &HashMap<PathBuf, Vec<PathBuf>>,
     keys_by_path: &HashMap<PathBuf, TrackKey>,
 ) -> Result<Vec<SourcePlaylist>> {
     let mut seen_names = HashMap::<String, usize>::new();
@@ -501,37 +630,15 @@ fn read_source_playlists(
         }
         let normalized_name = normalize_playlist_name(&name);
 
-        let bytes = fs::read(path)
-            .with_context(|| format!("could not read M3U playlist: {}", path.display()))?;
-        let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
-        let contents = std::str::from_utf8(bytes)
-            .with_context(|| format!("M3U playlist is not UTF-8: {}", path.display()))?;
-        let directory = path.parent().unwrap_or_else(|| Path::new("."));
-        let mut tracks = Vec::new();
-        for (line_index, line) in contents.lines().enumerate() {
-            let entry = line.trim();
-            if entry.is_empty() || entry.starts_with('#') {
-                continue;
-            }
-            let referenced = Path::new(entry);
-            let referenced = if referenced.is_absolute() {
-                referenced.to_path_buf()
-            } else {
-                directory.join(referenced)
-            };
-            let referenced = referenced.canonicalize().with_context(|| {
+        let entries = entries_by_playlist
+            .get(path)
+            .with_context(|| format!("playlist was not scanned: {}", path.display()))?;
+        let mut tracks = Vec::with_capacity(entries.len());
+        for referenced in entries {
+            let key = keys_by_path.get(referenced).with_context(|| {
                 format!(
-                    "{}:{} references a missing track: {}",
+                    "{} references a track outside the supplied sources: {}",
                     path.display(),
-                    line_index + 1,
-                    entry
-                )
-            })?;
-            let key = keys_by_path.get(&referenced).with_context(|| {
-                format!(
-                    "{}:{} references a track outside the supplied MP3 libraries: {}",
-                    path.display(),
-                    line_index + 1,
                     referenced.display()
                 )
             })?;
@@ -1044,6 +1151,17 @@ fn is_unsupported_audio(path: &Path) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn accepts_library_and_playlist_sources_together() {
+        let cli =
+            Cli::try_parse_from(["copyPod", "-l", "music", "-p", "mix.m3u", "-i", "ipod"]).unwrap();
+        assert_eq!(cli.libraries, [PathBuf::from("music")]);
+        assert_eq!(cli.playlist_inputs, [PathBuf::from("mix.m3u")]);
+        assert!(Cli::try_parse_from(["copyPod", "-p", "mix.m3u", "-i", "ipod"]).is_ok());
+        assert!(Cli::try_parse_from(["copyPod", "-l", "music", "-i", "ipod"]).is_ok());
+        assert!(Cli::try_parse_from(["copyPod", "-i", "ipod"]).is_err());
+    }
+
     fn test_metadata(title: &str) -> Metadata {
         Metadata {
             title: title.to_owned(),
@@ -1233,7 +1351,11 @@ mod tests {
             (first.canonicalize().unwrap(), first_key.clone()),
             (second.canonicalize().unwrap(), second_key.clone()),
         ]);
-        let playlists = read_source_playlists(&[playlist_path], &keys).unwrap();
+        let entries = HashMap::from([(
+            playlist_path.clone(),
+            read_playlist_entries(&playlist_path).unwrap(),
+        )]);
+        let playlists = read_source_playlists(&[playlist_path], &entries, &keys).unwrap();
 
         assert_eq!(playlists.len(), 1);
         assert_eq!(playlists[0].name, "Road Trip");
@@ -1241,6 +1363,39 @@ mod tests {
             playlists[0].tracks,
             vec![first_key.clone(), second_key, first_key]
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn discovers_playlists_recursively() {
+        let directory =
+            std::env::temp_dir().join(format!("copypod-playlist-dir-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(directory.join("nested")).unwrap();
+        fs::write(directory.join("nested/one.m3u"), []).unwrap();
+        fs::write(directory.join("ignored.txt"), []).unwrap();
+
+        let inputs = validate_playlist_inputs(std::slice::from_ref(&directory)).unwrap();
+        let playlists = discover_playlist_paths(&inputs).unwrap();
+        assert_eq!(playlists, [directory.join("nested/one.m3u")]);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_non_mp3_playlist_entries() {
+        let directory = std::env::temp_dir().join(format!(
+            "copypod-playlist-entry-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("song.flac"), []).unwrap();
+        let playlist = directory.join("mix.m3u");
+        fs::write(&playlist, b"song.flac\n").unwrap();
+
+        assert!(read_playlist_entries(&playlist).is_err());
+
         fs::remove_dir_all(directory).unwrap();
     }
 
