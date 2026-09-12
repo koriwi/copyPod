@@ -19,7 +19,8 @@ of those sources.
 - Syncs only the tracks referenced by selected `.m3u` and `.m3u8` files
 - Accepts individual playlists or recursively scanned playlist folders
 - Creates and updates standard iPod playlists and removes empty ones
-- Imports MP3s carrying the ID3 `PCST` marker as podcasts on the Nano 7G
+- Imports MP3s carrying the ID3 `PCST` marker as podcasts on Classic and Nano 7G
+- Shows live song/file progress during staging, database updates, installation and verification
 - Skips existing tracks without reading and hashing every file on the iPod
 - Matches tracks using tags, exact file size, duration, and track/disc numbers
 - Reads cover art embedded in MP3s
@@ -27,10 +28,43 @@ of those sources.
 - Adds missing artwork to existing tracks without copying the audio again
 - Checks for the FireWire GUID required by affected Nano and Classic models
 - Uses the authoritative SQLite library on supported modern Nanos
+- Supports iPod Classic, including the 160 GB revision B ("7th gen"), using HASH58-signed iTunesDB files
 
 copyPod uses the Rust `libopod` crate and has no libgpod, GLib, project C shim,
 or pkg-config integration. libopod stages and installs database changes as a
 recoverable transaction on supported iPod profiles.
+
+### iPod Classic (including 7G / revision B)
+
+Classic music, standard playlists and cover-art writes work on the operator's
+7G / revision B. Podcast writes now create the special Podcasts container,
+group episodes by show, remember playback position and skip episodes during
+shuffle; podcast playback still needs hardware verification. Back up the device and use `--dry-run`
+first. On Linux, an empty `SysInfo` is OK: USB detection supplies the Classic
+family and FireWire GUID. The shared USB ID cannot distinguish revisions;
+`MC293`/`MC297` model evidence identifies revision B specifically.
+
+A blank/restored iPod must have its library initialized with iTunes or another
+compatible manager before copyPod can sync it. An existing `iTunesDB` is
+required, and cover-art writes need an existing `ArtworkDB`.
+
+### Live sync progress
+
+After the plan, copyPod reports the work as it happens, for example:
+
+```text
+  [00:03] Staging audio and artwork [2/12]: Episode title
+  [00:08] Updating iTunesDB [2/12]: Episode title
+  [00:21] Installing [2/13]: Artist — Episode title
+  [00:35] Reading back installed library…
+```
+
+Counters restart for each operation; elapsed time starts with each commit.
+File counts can include database and artwork files, not just songs. Each line
+is flushed immediately, including when output goes to a log or pipe. Backups,
+signing, validation and final library reads also have status messages. A
+reported item is starting work, not yet complete; wait for the final `Done`
+message before ejecting. `--dry-run` still only shows the plan.
 
 ## Requirements
 

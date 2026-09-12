@@ -1,4 +1,5 @@
 mod opod;
+mod progress;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -158,7 +159,7 @@ fn run(cli: Cli) -> Result<()> {
         .count();
     if podcast_count != 0 && !database.supports_podcasts() {
         bail!(
-            "{podcast_count} MP3(s) carry the ID3 podcast marker, but podcast writes are currently supported only on the Nano 7G"
+            "{podcast_count} MP3(s) carry the ID3 podcast marker, but podcast writes are currently supported only on iPod Classic and Nano 7G"
         );
     }
 
@@ -231,12 +232,9 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
+    // The plan above describes queued changes; live progress comes from the
+    // staging/install callbacks below, when the work actually takes place.
     for entry in &deleted {
-        if entry.track.media_missing {
-            println!("REPAIR REMOVE {}", describe_existing(&entry.track));
-        } else {
-            println!("DELETE {}", describe_existing(&entry.track));
-        }
         database
             .remove_track(entry.track.handle)
             .with_context(|| format!("failed to delete {}", entry.track.path.display()))?;
@@ -254,10 +252,6 @@ fn run(cli: Cli) -> Result<()> {
     // by a fresh indexed entry carrying the artwork.
     for entry in &artwork_updates {
         let artwork = entry.source.artwork.as_ref().expect("filtered above");
-        println!(
-            "ART    {} — {} ({})",
-            entry.source.metadata.artist, entry.source.metadata.title, artwork.source
-        );
         database
             .remove_track(entry.existing.track.handle)
             .with_context(|| format!("failed to replace {}", entry.source.path.display()))?;
@@ -273,19 +267,6 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     for source in &copied {
-        let operation = if missing_track_keys.contains(&source_key(source)) {
-            "REPAIR RECOPY"
-        } else if source.metadata.media_kind == MediaKind::Podcast {
-            "PODCAST COPY"
-        } else {
-            "COPY         "
-        };
-        println!(
-            "{operation} {} — {} ({})",
-            source.metadata.artist,
-            source.metadata.title,
-            source.path.display()
-        );
         let artwork = if artwork_capable {
             source
                 .artwork

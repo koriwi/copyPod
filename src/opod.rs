@@ -110,6 +110,11 @@ impl Database {
     pub fn open(mountpoint: &Path) -> Result<Self> {
         let device = Device::open(mountpoint).context("libopod could not inspect the iPod")?;
         if device.library().is_none() {
+            if device.profile().is_some_and(|profile| {
+                profile.capabilities().backend == BackendKind::Binary
+            }) && !device.inspection().itunes_db_present {
+                bail!("the iPod has no iTunesDB; initialize its music library with iTunes or another compatible manager before using copyPod");
+            }
             bail!("libopod does not yet have a read adapter for this device profile");
         }
         Ok(Self {
@@ -150,9 +155,9 @@ impl Database {
             .is_some_and(|profile| profile.capabilities().supports_artwork())
     }
 
-    /// Whether this device has qualified podcast write support.
+    /// Whether libopod can write podcasts and the device's special container.
     pub fn supports_podcasts(&self) -> bool {
-        self.device.profile().map(libopod::DeviceProfile::key) == Some("nano-7g")
+        self.device.profile().is_some_and(libopod::DeviceProfile::supports_podcasts)
     }
 
     /// Whether libopod supports playlist mutations for this device profile.
@@ -329,6 +334,11 @@ impl Database {
             .edit()
             .context("libopod could not start an edit session")?;
         edit.set_media_policy(MediaDeletionPolicy::Delete);
+        let labels = self.device.library().into_iter().flat_map(|library| library.tracks())
+            .map(|track| (track.location.as_str().to_owned(), track_label(&track.artist, &track.title)))
+            .collect();
+        let mut progress = crate::progress::ProgressReporter::new(labels);
+        let mut addition_labels = Vec::new();
         for change in std::mem::take(&mut self.pending) {
             match change {
                 PendingChange::Remove(id) => {
@@ -371,6 +381,7 @@ impl Database {
                         reuse_album_art: false,
                         artwork_source,
                     };
+                    addition_labels.push(track_label(&change.metadata.artist, &change.metadata.title));
                     edit.add_track(addition).context("queue track addition")?;
                 }
                 PendingChange::CreatePlaylist { name, tracks } => {
@@ -391,16 +402,24 @@ impl Database {
         }
         let staging = tempfile::tempdir().context("create staging directory")?;
         let staged = edit
-            .stage_sqlite_preview(staging.path())
+            .stage_sqlite_preview_with_progress(staging.path(), |event| progress.report(event))
             .context("stage database changes")?;
+        for (path, label) in staged.added_media().iter().zip(addition_labels) {
+            progress.add_media(path.as_str(), label);
+        }
         staged
-            .install(&self.device)
+            .install_with_progress(&self.device, |event| progress.report(event))
             .context("install staged changes; rerun copyPod to retry")?;
         // The commit rewrote the device databases; refresh the cached device
         // (generation fingerprint, library) for the next write cycle.
+        progress.report(libopod::ProgressEvent::Phase("Refreshing iPod library"));
         self.device = Device::open(&self.mountpoint).context("reopen the iPod after the commit")?;
         Ok(())
     }
+}
+
+fn track_label(artist: &str, title: &str) -> String {
+    if artist.is_empty() { title.to_owned() } else { format!("{artist} — {title}") }
 }
 
 fn profile_supports_playlists(profile_key: &str, backend: BackendKind) -> bool {
@@ -428,8 +447,43 @@ mod tests {
     use libopod::BackendKind;
 
     #[test]
+    fn blank_classic_reports_the_missing_library() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = directory.path().join("iPod_Control/Device");
+        std::fs::create_dir_all(&identity).unwrap();
+        std::fs::write(identity.join("SysInfo"), "USBProductID: 0x1261").unwrap();
+        let error = super::Database::open(directory.path()).err().expect("blank library");
+        assert!(error.to_string().contains("initialize its music library"));
+    }
+
+    #[test]
+    fn classic_podcasts_use_the_library_capability() {
+        for (identity, expected) in [
+            ("ModelNumStr: MC293", true),
+            ("USBProductID: 0x1261", true),
+            ("USBProductID: 0x1267", true),
+            ("USBProductID: 0x1262", false),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("iPod_Control/Device");
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("SysInfo"), identity).unwrap();
+            let database = super::Database {
+                mountpoint: directory.path().to_path_buf(),
+                device: libopod::Device::open(directory.path()).unwrap(),
+                pending: Vec::new(),
+                artwork_sequence: 0,
+            };
+            assert_eq!(database.supports_podcasts(), expected, "{identity}");
+        }
+    }
+
+    #[test]
     fn enables_qualified_playlist_backends() {
         assert!(profile_supports_playlists("nano-3g", BackendKind::Binary));
+        for key in ["classic", "classic-6g", "classic-6.5g", "classic-7g"] {
+            assert!(profile_supports_playlists(key, BackendKind::Binary));
+        }
         assert!(profile_supports_playlists(
             "nano-7g",
             BackendKind::SqliteWithBinaryCompanion
