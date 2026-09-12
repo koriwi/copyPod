@@ -70,6 +70,37 @@ Source scanning, staging and database rewrites are unchanged, so this mainly
 helps bulk audio copies—not database- or artwork-bound operations. `--fast`
 also works with playlists and `--dry-run`; it never changes the mirror plan.
 
+### Smaller recoverable batches (`--batch-size N`)
+
+```console
+copyPod --library /path/to/music --ipod /path/to/ipod --batch-size 200 --fast
+```
+
+This commits the database after at most N complete track changes rather than
+waiting for the entire copy phase. Each batch is a separate verified,
+recoverable transaction. An interruption only rolls back the unfinished
+batch; earlier committed batches remain synced. Rerun the same command after
+recovery to finish the mirror without recopying those completed additions.
+Recovery still verifies/restores shared database and artwork files, but it
+no longer needs to revisit every MP3 added earlier in that run.
+
+- Deletions are batched separately, before additions.
+- An artwork replacement's remove/add pair stays in one batch and counts as
+  one track change. A partial final batch also commits.
+- M3U playlist updates wait until all track batches succeed, then use the
+  refreshed library IDs. They can remain unfinished if the sync is interrupted.
+- `--batch-size 1` works but is expensive. Try 100–500 as a starting point:
+  each commit repeats shared database/artwork backups, signing, verification
+  and library reads. Artwork-heavy syncs can slow down substantially with
+  small batches. `--fast` reduces MP3 reads, not this shared-file overhead.
+- Without this option, the existing single deletion batch and single
+  copy/artwork batch remain the default. `--dry-run` never commits any batch.
+
+The safe ordering within each batch is unchanged: copy new media first, then
+publish the database that references it. Deleted audio has no byte backup,
+so recovery cannot undo media deletions in an interrupted batch; rerunning
+with the same sources repairs missing references as usual.
+
 ### Live sync progress
 
 After the plan, copyPod reports the work as it happens, for example:

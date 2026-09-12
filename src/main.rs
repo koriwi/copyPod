@@ -1,9 +1,11 @@
+mod batch;
 mod opod;
 mod progress;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -16,6 +18,7 @@ use lofty::probe::Probe;
 use lofty::tag::ItemKey;
 use walkdir::WalkDir;
 
+use crate::batch::TrackBatches;
 use crate::opod::{Database, Metadata, Playlist, PlaylistHandle, Track, TrackHandle};
 use libopod::MediaKind;
 
@@ -52,6 +55,10 @@ struct Cli {
     /// Verify new MP3s during copying; skip full MP3 destination read-back (database checks/backups stay enabled)
     #[arg(long)]
     fast: bool,
+
+    /// Commit every N complete track changes to limit recovery work (more commits add overhead)
+    #[arg(long, value_name = "N")]
+    batch_size: Option<NonZeroUsize>,
 }
 
 #[derive(Debug)]
@@ -234,6 +241,9 @@ fn run(cli: Cli) -> Result<()> {
     }
     print_plan(&deleted, &copied, &artwork_updates, &missing_track_keys);
     print_playlist_plan(&playlist_plan);
+    if let Some(limit) = cli.batch_size {
+        println!("Batch mode: at most {limit} track changes per transaction; artwork replacements stay together and M3U updates follow all track batches.");
+    }
 
     if cli.dry_run {
         println!("Dry run: no files or database entries were changed.");
@@ -242,22 +252,24 @@ fn run(cli: Cli) -> Result<()> {
 
     // The plan above describes queued changes; live progress comes from the
     // staging/install callbacks below, when the work actually takes place.
+    let mut deletion_batches = TrackBatches::new(cli.batch_size, deleted.len(), "deletion");
     for entry in &deleted {
         database
             .remove_track(entry.track.handle)
             .with_context(|| format!("failed to delete {}", entry.track.path.display()))?;
+        deletion_batches.queued(|| database.write())?;
     }
 
-    // Commit deletions separately. If a subsequent copy fails, the database and
-    // filesystem still agree and rerunning copyPod can finish the mirror.
-    if !deleted.is_empty() {
-        database
-            .write()
-            .context("failed to save deletions to the iPod database")?;
-    }
+    // Keep deletions separate from additions, including a partial final batch.
+    // Already committed batches survive a failure in a later transaction.
+    deletion_batches.finish(|| database.write())?;
 
     // Tracks kept without artwork but with artwork in the source are replaced
-    // by a fresh indexed entry carrying the artwork.
+    // by a fresh indexed entry carrying the artwork. The remove/add pair is
+    // one logical change: never commit between its two queue operations.
+    let mut addition_batches = TrackBatches::new(
+        cli.batch_size, artwork_updates.len() + copied.len(), "copy/artwork",
+    );
     for entry in &artwork_updates {
         let artwork = entry.source.artwork.as_ref().expect("filtered above");
         database
@@ -272,6 +284,7 @@ fn run(cli: Cli) -> Result<()> {
             .with_context(|| {
                 format!("failed to add artwork for {}", entry.source.path.display())
             })?;
+        addition_batches.queued(|| database.write())?;
     }
 
     for source in &copied {
@@ -291,14 +304,13 @@ fn run(cli: Cli) -> Result<()> {
                     source.path.display()
                 )
             })?;
+        addition_batches.queued(|| database.write())?;
     }
 
-    database
-        .write()
-        .context("failed to commit copied tracks or artwork to the iPod database")?;
+    addition_batches.finish(|| database.write())?;
 
     // Additions and artwork replacements receive their persistent IDs during
-    // the track commit, so rebuild the playlist plan against the refreshed
+    // the track commits, so rebuild the playlist plan against the refreshed
     // library before queueing playlist mutations.
     let playlist_plan = if source_playlists.is_empty() {
         PlaylistPlan::default()
@@ -1231,6 +1243,21 @@ fn is_unsupported_audio(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_size_is_positive_optional_and_compatible_with_fast_dry_run() {
+        let normal = Cli::try_parse_from(["copyPod", "-l", "music", "-i", "ipod"]).unwrap();
+        assert!(normal.batch_size.is_none());
+        let cli = Cli::try_parse_from([
+            "copyPod", "-p", "mix.m3u", "-i", "ipod", "--batch-size", "200", "--fast", "--dry-run",
+        ]).unwrap();
+        assert_eq!(cli.batch_size.map(NonZeroUsize::get), Some(200));
+        assert!(cli.fast && cli.dry_run);
+        assert!(Cli::try_parse_from(["copyPod", "-l", "music", "-i", "ipod", "--batch-size", "1"]).is_ok());
+        for invalid in ["0", "invalid", "99999999999999999999999999999999999999"] {
+            assert!(Cli::try_parse_from(["copyPod", "-l", "music", "-i", "ipod", "--batch-size", invalid]).is_err());
+        }
+    }
 
     #[test]
     fn fast_sync_is_opt_in_and_can_be_combined_with_dry_run() {

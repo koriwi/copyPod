@@ -251,8 +251,8 @@ impl Database {
             .collect())
     }
 
-    /// Queues a track removal. The media file is deleted as part of the
-    /// commit (libopod backs it up and restores it on rollback).
+    /// Queues a track removal. The commit deletes its media file without a
+    /// byte backup; rollback can restore the database but not deleted audio.
     pub fn remove_track(&mut self, track: TrackHandle) -> Result<()> {
         let present = self.device.library().is_some_and(|library| {
             library
