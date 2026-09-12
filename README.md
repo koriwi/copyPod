@@ -88,6 +88,13 @@ signing, validation and final library reads also have status messages. A
 reported item is starting work, not yet complete; wait for the final `Done`
 message before ejecting. `--dry-run` still only shows the plan.
 
+Interrupted-transaction recovery uses the same live output after you confirm
+the recovery prompt, including verification, temporary-file cleanup, backup
+restoration and final cleanup. Automatic rollback after a failed installation
+also reports progress. Recovery shows device-relative file paths rather than
+song titles because the interrupted library may be inconsistent. Its strict
+verification remains enabled even if the interrupted sync used `--fast`.
+
 ## Requirements
 
 - Linux, macOS, or Windows

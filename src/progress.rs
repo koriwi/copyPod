@@ -115,6 +115,34 @@ mod tests {
     }
 
     #[test]
+    fn recovery_reports_paths_without_needing_library_labels() {
+        let reporter = ProgressReporter::new(HashMap::new());
+        let mut output = Output::default();
+        reporter.write_event(
+            ProgressEvent::Phase("Reading recovery journal"),
+            &mut output,
+        );
+        reporter.write_event(
+            ProgressEvent::Item {
+                operation: "Restoring recovery backup",
+                current: 1,
+                total: 2,
+                name: "iPod_Control/iTunes/iTunesDB",
+            },
+            &mut output,
+        );
+        reporter.write_event(
+            ProgressEvent::Phase("Removing recovery journal and backups"),
+            &mut output,
+        );
+        let text = String::from_utf8(output.bytes).unwrap();
+        assert!(text.contains("Reading recovery journal"));
+        assert!(text.contains("Restoring recovery backup [1/2]: iPod_Control/iTunes/iTunesDB"));
+        assert!(text.contains("Removing recovery journal and backups"));
+        assert_eq!(output.flushes, 3);
+    }
+
+    #[test]
     fn broken_progress_output_does_not_abort_a_transaction() {
         struct Broken;
         impl Write for Broken {

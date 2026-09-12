@@ -133,8 +133,13 @@ impl Database {
 
     /// Recovers an interrupted libopod transaction at `mountpoint`.
     pub fn recover_interrupted_transaction(mountpoint: &Path) -> Result<bool> {
-        libopod::recover_interrupted_transaction(mountpoint)
-            .context("libopod could not recover the interrupted transaction")
+        // Do not open the inconsistent library for labels before recovery.
+        // The reporter falls back to the device-relative journal paths.
+        let progress = crate::progress::ProgressReporter::new(Default::default());
+        libopod::recover_interrupted_transaction_with_progress(mountpoint, |event| {
+            progress.report(event);
+        })
+        .context("libopod could not recover the interrupted transaction")
     }
 
     pub fn description(&self) -> String {
