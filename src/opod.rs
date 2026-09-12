@@ -100,7 +100,6 @@ struct PendingAdd {
 }
 
 pub struct Database {
-    mountpoint: PathBuf,
     device: Device,
     pending: Vec<PendingChange>,
     artwork_sequence: u64,
@@ -119,7 +118,6 @@ impl Database {
             bail!("libopod does not yet have a read adapter for this device profile");
         }
         Ok(Self {
-            mountpoint: mountpoint.to_path_buf(),
             device,
             pending: Vec::new(),
             artwork_sequence: 0,
@@ -418,13 +416,12 @@ impl Database {
         for (path, label) in staged.added_media().iter().zip(addition_labels) {
             progress.add_media(path.as_str(), label);
         }
-        staged
-            .install_with_mode(&self.device, self.install_mode, |event| progress.report(event))
+        // Installation already reads back the library and captures its new
+        // generation. Reuse that handle instead of rereading all databases and
+        // thumbnail files a second time after every batch.
+        self.device = staged
+            .install_and_open(&self.device, self.install_mode, |event| progress.report(event))
             .context("install staged changes; rerun copyPod to retry")?;
-        // The commit rewrote the device databases; refresh the cached device
-        // (generation fingerprint, library) for the next write cycle.
-        progress.report(libopod::ProgressEvent::Phase("Refreshing iPod library"));
-        self.device = Device::open(&self.mountpoint).context("reopen the iPod after the commit")?;
         Ok(())
     }
 }
@@ -480,7 +477,6 @@ mod tests {
             std::fs::create_dir_all(&path).unwrap();
             std::fs::write(path.join("SysInfo"), identity).unwrap();
             let mut database = super::Database {
-                mountpoint: directory.path().to_path_buf(),
                 device: libopod::Device::open(directory.path()).unwrap(),
                 pending: Vec::new(),
                 artwork_sequence: 0,

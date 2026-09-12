@@ -1,4 +1,4 @@
-use std::num::NonZeroUsize;
+use std::{num::NonZeroUsize, time::Instant};
 
 use anyhow::{Context, Result};
 
@@ -49,15 +49,17 @@ impl TrackBatches {
             "Committing {} batch {batch}/{total_batches}: {} track change(s) ({} / {} already committed)…",
             self.phase, self.pending, self.committed, self.total_tracks,
         );
+        let started = Instant::now();
         commit().with_context(|| format!(
             "{} batch {batch}/{total_batches} failed; {} earlier batch(es), {} track change(s), completed. Recover if prompted and rerun the same sync to finish",
             self.phase, self.completed_batches, self.committed,
         ))?;
+        let elapsed = started.elapsed().as_secs_f64();
         self.committed += self.pending;
         self.pending = 0;
         self.completed_batches = batch;
         println!(
-            "Committed {} batch {batch}/{total_batches}: {} / {} track change(s) complete.",
+            "Committed {} batch {batch}/{total_batches} in {elapsed:.1}s: {} / {} track change(s) complete.",
             self.phase, self.committed, self.total_tracks,
         );
         Ok(())

@@ -93,6 +93,8 @@ no longer needs to revisit every MP3 added earlier in that run.
   each commit repeats shared database/artwork backups, signing, verification
   and library reads. Artwork-heavy syncs can slow down substantially with
   small batches. `--fast` reduces MP3 reads, not this shared-file overhead.
+- Each completed batch reports elapsed seconds for staging and installation,
+  so you can compare batch sizes on your own device.
 - Without this option, the existing single deletion batch and single
   copy/artwork batch remain the default. `--dry-run` never commits any batch.
 
@@ -100,6 +102,14 @@ The safe ordering within each batch is unchanged: copy new media first, then
 publish the database that references it. Deleted audio has no byte backup,
 so recovery cannot undo media deletions in an interrupted batch; rerunning
 with the same sources repairs missing references as usual.
+
+Batching now avoids several redundant reads: staging verifies inputs through
+its host backup, builds thumbnail files with append-only host writes, and
+supplies on-device rollback backups from the verified host snapshot. copyPod
+also scans the media directories once per batch and reuses installation's
+validated device handle instead of reopening the whole library again.
+Shared files still need backup, installation and verification on every commit;
+small batches are not free, even with `--fast`.
 
 ### Live sync progress
 
