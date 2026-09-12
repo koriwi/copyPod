@@ -48,6 +48,28 @@ A blank/restored iPod must have its library initialized with iTunes or another
 compatible manager before copyPod can sync it. An existing `iTunesDB` is
 required, and cover-art writes need an existing `ArtworkDB`.
 
+### Faster sync (`--fast`)
+
+```console
+copyPod --library /path/to/music --ipod /path/to/ipod --fast
+```
+
+Fast mode reduces repeated reads of **new MP3 files**. It checks their staged
+sizes, computes and verifies SHA-256 while copying, flushes the files, and
+checks their installed sizes. It skips the two separate pre-install MP3 hash
+passes and the full MP3 read-back from the iPod.
+
+**Trade-off:** fast mode cannot detect corruption on the destination that
+leaves an MP3's size unchanged. Use normal mode (the default) for full
+read-back verification, particularly with questionable storage or cables.
+
+Database and artwork checks, required signing, source-change detection,
+backups, the recovery journal, disk flushes and library read-back stay enabled.
+Recovery always uses the existing strict checks, regardless of sync mode.
+Source scanning, staging and database rewrites are unchanged, so this mainly
+helps bulk audio copies—not database- or artwork-bound operations. `--fast`
+also works with playlists and `--dry-run`; it never changes the mirror plan.
+
 ### Live sync progress
 
 After the plan, copyPod reports the work as it happens, for example:

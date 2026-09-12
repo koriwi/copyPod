@@ -104,6 +104,7 @@ pub struct Database {
     device: Device,
     pending: Vec<PendingChange>,
     artwork_sequence: u64,
+    install_mode: libopod::InstallMode,
 }
 
 impl Database {
@@ -122,7 +123,12 @@ impl Database {
             device,
             pending: Vec::new(),
             artwork_sequence: 0,
+            install_mode: libopod::InstallMode::Full,
         })
+    }
+
+    pub fn set_fast_sync(&mut self, fast: bool) {
+        self.install_mode = if fast { libopod::InstallMode::Fast } else { libopod::InstallMode::Full };
     }
 
     /// Recovers an interrupted libopod transaction at `mountpoint`.
@@ -408,7 +414,7 @@ impl Database {
             progress.add_media(path.as_str(), label);
         }
         staged
-            .install_with_progress(&self.device, |event| progress.report(event))
+            .install_with_mode(&self.device, self.install_mode, |event| progress.report(event))
             .context("install staged changes; rerun copyPod to retry")?;
         // The commit rewrote the device databases; refresh the cached device
         // (generation fingerprint, library) for the next write cycle.
@@ -468,13 +474,18 @@ mod tests {
             let path = directory.path().join("iPod_Control/Device");
             std::fs::create_dir_all(&path).unwrap();
             std::fs::write(path.join("SysInfo"), identity).unwrap();
-            let database = super::Database {
+            let mut database = super::Database {
                 mountpoint: directory.path().to_path_buf(),
                 device: libopod::Device::open(directory.path()).unwrap(),
                 pending: Vec::new(),
                 artwork_sequence: 0,
+                install_mode: libopod::InstallMode::Full,
             };
             assert_eq!(database.supports_podcasts(), expected, "{identity}");
+            database.set_fast_sync(true);
+            assert_eq!(database.install_mode, libopod::InstallMode::Fast);
+            database.set_fast_sync(false);
+            assert_eq!(database.install_mode, libopod::InstallMode::Full);
         }
     }
 

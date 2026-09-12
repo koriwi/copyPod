@@ -48,6 +48,10 @@ struct Cli {
     /// Print the synchronization plan without changing the iPod
     #[arg(long)]
     dry_run: bool,
+
+    /// Verify new MP3s during copying; skip full MP3 destination read-back (database checks/backups stay enabled)
+    #[arg(long)]
+    fast: bool,
 }
 
 #[derive(Debug)]
@@ -145,7 +149,11 @@ fn run(cli: Cli) -> Result<()> {
 
     println!("Reading iPod database at {}…", ipod.display());
     let mut database = open_database_with_recovery(&ipod, cli.dry_run)?;
+    database.set_fast_sync(cli.fast);
     println!("Device: {}", database.description());
+    if cli.fast {
+        println!("Fast mode: hash new MP3s during copying, then check their sizes without full destination read-back. Database checks, backups and disk flushes stay enabled.");
+    }
     check_firewire_guid(&database, &ipod)?;
     if !source_playlists.is_empty() && !database.supports_playlists() {
         bail!(
@@ -1223,6 +1231,17 @@ fn is_unsupported_audio(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fast_sync_is_opt_in_and_can_be_combined_with_dry_run() {
+        let normal = Cli::try_parse_from(["copyPod", "-l", "music", "-i", "ipod"]).unwrap();
+        assert!(!normal.fast);
+        let fast = Cli::try_parse_from(["copyPod", "-l", "music", "-i", "ipod", "--fast"]).unwrap();
+        assert!(fast.fast);
+        assert!(!fast.dry_run);
+        let dry_run = Cli::try_parse_from(["copyPod", "-p", "mix.m3u", "-i", "ipod", "--fast", "--dry-run"]).unwrap();
+        assert!(dry_run.fast && dry_run.dry_run);
+    }
 
     #[test]
     fn accepts_library_and_playlist_sources_together() {
