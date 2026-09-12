@@ -103,13 +103,23 @@ publish the database that references it. Deleted audio has no byte backup,
 so recovery cannot undo media deletions in an interrupted batch; rerunning
 with the same sources repairs missing references as usual.
 
-Batching now avoids several redundant reads: staging verifies inputs through
-its host backup, builds thumbnail files with append-only host writes, and
-supplies on-device rollback backups from the verified host snapshot. copyPod
-also scans the media directories once per batch and reuses installation's
-validated device handle instead of reopening the whole library again.
-Shared files still need backup, installation and verification on every commit;
-small batches are not free, even with `--fast`.
+Batching avoids several redundant reads: staging verifies inputs through its
+host backup, builds thumbnail files with append-only host writes, scans media
+directories once per batch, and reuses installation's validated device handle.
+
+On-device backups now preserve originals by **rename**, not by copying their
+contents. Each replacement must finish copying, flushing and verification before
+its original moves to the recovery directory. The original remains available
+until commit; rollback can rename it back without another full-file copy.
+This applies in both Full and `--fast` modes. It removes the duplicate backup
+write, but installing whole replacement artwork files still costs time.
+
+New transactions use journal version 3 in the existing `.libopod-transaction-v1`
+directory. Current copyPod also recovers older version 2 transactions; older
+binaries cannot recover version 3. Do not downgrade with a pending transaction.
+An interruption between renames can leave a live file temporarily absent, so
+complete recovery before using the iPod. Keep an independent verified backup:
+rename recovery has synthetic interruption tests but still needs hardware testing.
 
 ### Live sync progress
 

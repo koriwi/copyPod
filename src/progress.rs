@@ -143,6 +143,27 @@ mod tests {
     }
 
     #[test]
+    fn rename_preservation_publication_and_terminal_recovery_are_visible() {
+        let reporter = ProgressReporter::new(HashMap::new());
+        let mut output = Output::default();
+        let phases = [
+            "Rechecking device before installation",
+            "Preserving original file by rename",
+            "Publishing verified replacement",
+            "Transaction already rolled back; keeping restored files",
+        ];
+        for phase in phases {
+            reporter.write_event(ProgressEvent::Phase(phase), &mut output);
+        }
+        let text = String::from_utf8(output.bytes).unwrap();
+        for phase in phases {
+            assert!(text.contains(phase));
+        }
+        assert_eq!(output.flushes, phases.len());
+        assert_eq!(text.lines().count(), phases.len());
+    }
+
+    #[test]
     fn broken_progress_output_does_not_abort_a_transaction() {
         struct Broken;
         impl Write for Broken {
