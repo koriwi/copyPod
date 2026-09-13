@@ -111,15 +111,30 @@ On-device backups now preserve originals by **rename**, not by copying their
 contents. Each replacement must finish copying, flushing and verification before
 its original moves to the recovery directory. The original remains available
 until commit; rollback can rename it back without another full-file copy.
-This applies in both Full and `--fast` modes. It removes the duplicate backup
-write, but installing whole replacement artwork files still costs time.
+This applies in both Full and `--fast` modes.
 
-New transactions use journal version 3 in the existing `.libopod-transaction-v1`
-directory. Current copyPod also recovers older version 2 transactions; older
-binaries cannot recover version 3. Do not downgrade with a pending transaction.
-An interruption between renames can leave a live file temporarily absent, so
-complete recovery before using the iPod. Keep an independent verified backup:
-rename recovery has synthetic interruption tests but still needs hardware testing.
+Large aligned thumbnail files can now **append only new frames** when their
+original prefix stays unchanged. This is automatic on supported Unix hosts for
+Classic/Nano 3G `F1060_1.ithmb` and Classic/Nano 3G/4G `F1055_1.ithmb` and
+`F1068_1.ithmb`. Small unaligned formats (including `F1061_1.ithmb`), reindexed
+files and other ineligible cases keep full replacement. If spooling and appending
+a large new suffix would cost more than replacement, replacement wins.
+
+Only the new suffix gets a separate verified on-device copy. The old bytes stay
+in the live thumbnail. Recovery checks the old prefix and any partial appended
+bytes against that suffix copy before truncating to the original length. Signing,
+full artwork verification, flushes and library read-back remain enabled; `--fast`
+still changes only MP3 verification. Host previews remain full-size files.
+Look for `Appending artwork`, `Preparing verified thumbnail suffix` and
+`Appending verified thumbnail suffix` in progress output.
+
+New transactions use journal version 4 in the existing `.libopod-transaction-v1`
+directory. Current copyPod also recovers versions 2 and 3; older binaries cannot
+recover version 4. Do not downgrade with a pending transaction. Finish append
+recovery on a supported Unix host before switching hosts. An interruption between
+renames can leave a live file temporarily absent: recover before using the iPod.
+Keep an independent verified backup. Rename/append recovery has synthetic
+interruption tests but still needs hardware power-loss qualification.
 
 ### Live sync progress
 

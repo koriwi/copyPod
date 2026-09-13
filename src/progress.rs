@@ -164,6 +164,45 @@ mod tests {
     }
 
     #[test]
+    fn incremental_artwork_and_truncation_progress_are_flushed() {
+        let reporter = ProgressReporter::new(HashMap::new());
+        let mut output = Output::default();
+        let path = "iPod_Control/Artwork/F1060_1.ithmb";
+        reporter.write_event(
+            ProgressEvent::Item {
+                operation: "Appending artwork",
+                current: 3,
+                total: 7,
+                name: path,
+            },
+            &mut output,
+        );
+        for phase in [
+            "Reserving recovery journal space",
+            "Preparing verified thumbnail suffix",
+            "Appending verified thumbnail suffix",
+        ] {
+            reporter.write_event(ProgressEvent::Phase(phase), &mut output);
+        }
+        reporter.write_event(
+            ProgressEvent::Item {
+                operation: "Truncating appended thumbnail",
+                current: 5,
+                total: 6,
+                name: path,
+            },
+            &mut output,
+        );
+        let text = String::from_utf8(output.bytes).unwrap();
+        assert!(text.contains(&format!("Appending artwork [3/7]: {path}")));
+        assert!(text.contains("Preparing verified thumbnail suffix"));
+        assert!(text.contains("Appending verified thumbnail suffix"));
+        assert!(text.contains(&format!("Truncating appended thumbnail [5/6]: {path}")));
+        assert_eq!(output.flushes, 5);
+        assert_eq!(text.lines().count(), 5);
+    }
+
+    #[test]
     fn broken_progress_output_does_not_abort_a_transaction() {
         struct Broken;
         impl Write for Broken {
